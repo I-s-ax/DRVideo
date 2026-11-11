@@ -14,7 +14,7 @@ JAR="$PREFIX/share/aapt/android.jar"
 
 rm -rf build && mkdir -p build/classes
 echo "[1/4] Empaquetando manifest..."
-aapt package -f -M AndroidManifest.xml -I "$JAR" -F build/base.apk
+aapt package -f -M AndroidManifest.xml -S res -I "$JAR" -F build/base.apk
 
 echo "[2/4] Compilando Java..."
 javac --release 8 -classpath "$JAR" -d build/classes $(find src -name '*.java') 2>/dev/null \
