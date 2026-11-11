@@ -44,6 +44,9 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -140,7 +143,7 @@ public class MainActivity extends Activity {
         header.addView(gear, new LinearLayout.LayoutParams(dp(44), dp(44)));
         col.addView(header);
 
-        TextView sub = text("Descarga videos sin marca de agua", 14, cSub, false);
+        TextView sub = text("TikTok e Instagram, sin marca de agua", 14, cSub, false);
         sub.setPadding(0, dp(6), 0, 0);
         col.addView(sub);
 
@@ -156,7 +159,7 @@ public class MainActivity extends Activity {
         card.addView(text("Enlace del video", 13, cSub, true));
 
         input = new EditText(this);
-        input.setHint("https://vm.tiktok.com/…");
+        input.setHint("Enlace de TikTok o Instagram");
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         input.setTextColor(cText);
@@ -197,12 +200,12 @@ public class MainActivity extends Activity {
         card.addView(progress, plp);
 
         status = text(keepStatus != null ? keepStatus.toString()
-            : "Tip: en TikTok toca Compartir → TikTok DL", 14, cSub, false);
+            : "Tip: en TikTok o Instagram toca Compartir → TikTok DL", 14, cSub, false);
         status.setPadding(0, dp(10), 0, 0);
         card.addView(status);
         setBusy(busy);
 
-        TextView foot = text("Se guardan en Descargas/TikTok", 12, cSub, false);
+        TextView foot = text("Se guardan en Descargas/TikTok y Descargas/Instagram", 12, cSub, false);
         foot.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(-1, -2);
         flp.topMargin = dp(20);
@@ -396,30 +399,24 @@ public class MainActivity extends Activity {
     private void download() {
         if (busy) return;
         final String url = extractUrl(input.getText().toString());
-        if (url == null || !url.contains("tiktok")) {
-            status.setText("Enlace no válido. Debe ser de tiktok.com o vm.tiktok.com");
+        final boolean isTikTok = url != null && url.contains("tiktok.com");
+        final boolean isInsta = url != null && (url.contains("instagram.com") || url.contains("instagr.am"));
+        if (!isTikTok && !isInsta) {
+            status.setText("Enlace no válido. Usa un enlace de TikTok o Instagram.");
             return;
         }
         setBusy(true);
-        status.setText("Obteniendo video…");
+        status.setText(isTikTok ? "Obteniendo video de TikTok…" : "Obteniendo video de Instagram…");
 
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    String api = "https://www.tikwm.com/api/?hd=1&url=" + URLEncoder.encode(url, "UTF-8");
-                    JSONObject j = new JSONObject(get(api));
-                    if (j.optInt("code", -1) != 0) {
-                        throw new Exception(j.optString("msg", "La API no respondió bien"));
-                    }
-                    JSONObject d = j.getJSONObject("data");
-                    String video = d.optString("hdplay", "");
-                    if (video.isEmpty()) video = d.optString("play", "");
-                    if (video.isEmpty()) throw new Exception("No hay video (¿es un carrusel de fotos?)");
-                    if (video.startsWith("/")) video = "https://www.tikwm.com" + video;
-
-                    String name = "tiktok_" + d.optString("id", String.valueOf(System.currentTimeMillis())) + ".mp4";
-                    enqueue(video, name);
-                    done("✓ Descargando " + name + "\nMira las notificaciones.");
+                    List<String[]> items = isTikTok ? fetchTikTok(url) : fetchInstagram(url);
+                    String folder = isTikTok ? "TikTok" : "Instagram";
+                    for (String[] it : items) enqueue(it[0], folder, it[1]);
+                    done(items.size() == 1
+                        ? "✓ Descargando " + items.get(0)[1] + "\nMira las notificaciones."
+                        : "✓ Descargando " + items.size() + " videos\nMira las notificaciones.");
                 } catch (Exception e) {
                     done("Error: " + e.getMessage());
                 }
@@ -427,28 +424,165 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private static String get(String u) throws Exception {
+    // ---------- TikTok ----------
+
+    private static List<String[]> fetchTikTok(String url) throws Exception {
+        String api = "https://www.tikwm.com/api/?hd=1&url=" + URLEncoder.encode(url, "UTF-8");
+        JSONObject j = new JSONObject(http("GET", api, null, null));
+        if (j.optInt("code", -1) != 0) {
+            throw new Exception(j.optString("msg", "La API no respondió bien"));
+        }
+        JSONObject d = j.getJSONObject("data");
+        String video = d.optString("hdplay", "");
+        if (video.isEmpty()) video = d.optString("play", "");
+        if (video.isEmpty()) throw new Exception("No hay video (¿es un carrusel de fotos?)");
+        if (video.startsWith("/")) video = "https://www.tikwm.com" + video;
+
+        List<String[]> out = new ArrayList<String[]>();
+        out.add(new String[]{video, "tiktok_" + d.optString("id", String.valueOf(System.currentTimeMillis())) + ".mp4"});
+        return out;
+    }
+
+    // ---------- Instagram ----------
+
+    private static final String IG_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    private static final String IG_APP_ID = "936619743392459";
+    private static final String IG_DOC_ID = "8845758582119845";
+    private static final String IG_LSD = "AVqbxe3J_YA";
+
+    private static String igShortcode(String url) {
+        Matcher m = Pattern.compile("instagr(?:am\\.com|\\.am)/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)").matcher(url);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private static List<String[]> fetchInstagram(String url) throws Exception {
+        if (url.contains("/stories/")) throw new Exception("Las historias requieren iniciar sesión; no son compatibles.");
+        String code = igShortcode(url);
+        if (code == null) throw new Exception("No reconocí el enlace. Usa uno de un reel o publicación.");
+
+        List<String[]> out = new ArrayList<String[]>();
+        // 1) API GraphQL pública (la que usa la web de Instagram)
+        try {
+            out = igGraphql(code);
+        } catch (Exception ignored) { }
+        // 2) Respaldo: página embed
+        if (out.isEmpty()) {
+            try {
+                out = igEmbed(code);
+            } catch (Exception ignored) { }
+        }
+        if (out.isEmpty()) {
+            throw new Exception("No encontré video. Puede ser una cuenta privada, una publicación solo de fotos, o Instagram limitó las solicitudes (intenta en unos minutos).");
+        }
+        return out;
+    }
+
+    private static List<String[]> igGraphql(String code) throws Exception {
+        String vars = "{\"shortcode\":\"" + code + "\",\"fetch_tagged_user_count\":null,"
+            + "\"hoisted_comment_id\":null,\"hoisted_reply_id\":null}";
+        String body = "variables=" + URLEncoder.encode(vars, "UTF-8")
+            + "&doc_id=" + IG_DOC_ID + "&lsd=" + IG_LSD;
+        String[][] h = {
+            {"User-Agent", IG_UA},
+            {"Content-Type", "application/x-www-form-urlencoded"},
+            {"X-IG-App-ID", IG_APP_ID},
+            {"X-FB-LSD", IG_LSD},
+            {"X-ASBD-ID", "129477"},
+            {"Sec-Fetch-Site", "same-origin"},
+            {"Origin", "https://www.instagram.com"},
+            {"Referer", "https://www.instagram.com/p/" + code + "/"},
+        };
+        JSONObject root = new JSONObject(http("POST", "https://www.instagram.com/graphql/query", body, h));
+        JSONObject media = root.getJSONObject("data").optJSONObject("xdt_shortcode_media");
+        List<String[]> out = new ArrayList<String[]>();
+        if (media == null) return out;
+
+        JSONObject side = media.optJSONObject("edge_sidecar_to_children");
+        if (side != null) {
+            org.json.JSONArray edges = side.optJSONArray("edges");
+            int n = 0;
+            for (int i = 0; edges != null && i < edges.length(); i++) {
+                JSONObject node = edges.getJSONObject(i).getJSONObject("node");
+                String v = node.optString("video_url", "");
+                if (node.optBoolean("is_video") && !v.isEmpty()) {
+                    n++;
+                    out.add(new String[]{v, "ig_" + code + "_" + n + ".mp4"});
+                }
+            }
+        } else if (media.optBoolean("is_video")) {
+            String v = media.optString("video_url", "");
+            if (!v.isEmpty()) out.add(new String[]{v, "ig_" + code + ".mp4"});
+        }
+        return out;
+    }
+
+    private static List<String[]> igEmbed(String code) throws Exception {
+        String html = http("GET", "https://www.instagram.com/p/" + code + "/embed/captioned/", null,
+            new String[][]{{"User-Agent", IG_UA}});
+        List<String[]> out = new ArrayList<String[]>();
+        Matcher m = Pattern.compile("video_url\\\\?\"\\s*:\\s*\\\\?\"(.+?)\\\\?\"").matcher(html);
+        int n = 0;
+        List<String> seen = new ArrayList<String>();
+        while (m.find()) {
+            String v = unescape(m.group(1));
+            if (!v.startsWith("http") || seen.contains(v)) continue;
+            seen.add(v);
+            n++;
+            out.add(new String[]{v, "ig_" + code + (n > 1 ? "_" + n : "") + ".mp4"});
+        }
+        return out;
+    }
+
+    /** Quita los escapes JSON (\\/ , \\u0026, y doble escape dentro de HTML). */
+    private static String unescape(String s) {
+        String r = s;
+        for (int i = 0; i < 2 && r.contains("\\"); i++) {
+            try {
+                r = new JSONObject("{\"u\":\"" + r.replace("\"", "\\\"") + "\"}").getString("u");
+            } catch (Exception e) {
+                break;
+            }
+        }
+        return r.replace("&amp;", "&");
+    }
+
+    // ---------- Red ----------
+
+    private static String http(String method, String u, String body, String[][] headers) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
-        c.setRequestProperty("User-Agent", UA);
+        c.setRequestMethod(method);
         c.setConnectTimeout(15000);
         c.setReadTimeout(20000);
-        BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+        c.setRequestProperty("User-Agent", UA);
+        if (headers != null) for (String[] h : headers) c.setRequestProperty(h[0], h[1]);
+        if (body != null) {
+            c.setDoOutput(true);
+            OutputStream os = c.getOutputStream();
+            os.write(body.getBytes("UTF-8"));
+            os.close();
+        }
+        int code = c.getResponseCode();
+        InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (in == null) throw new Exception("HTTP " + code);
+        BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
         StringBuilder sb = new StringBuilder();
         String line;
-        while ((line = r.readLine()) != null) sb.append(line);
+        while ((line = r.readLine()) != null) sb.append(line).append('\n');
         r.close();
         c.disconnect();
+        if (code >= 400) throw new Exception("HTTP " + code);
         return sb.toString();
     }
 
-    private void enqueue(String videoUrl, String name) {
+    private void enqueue(String videoUrl, String folder, String name) {
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
         DownloadManager.Request req = new DownloadManager.Request(Uri.parse(videoUrl));
         req.addRequestHeader("User-Agent", UA);
         req.setTitle(name);
         req.setDescription("TikTok DL");
         req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-        req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TikTok/" + name);
+        req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, folder + "/" + name);
         dm.enqueue(req);
     }
 
