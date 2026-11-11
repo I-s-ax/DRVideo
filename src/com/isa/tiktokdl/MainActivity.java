@@ -450,35 +450,85 @@ public class MainActivity extends Activity {
     private static final String IG_APP_ID = "936619743392459";
     private static final String IG_DOC_ID = "8845758582119845";
     private static final String IG_LSD = "AVqbxe3J_YA";
+    private static final Pattern IG_CODE = Pattern.compile(
+        "instagr(?:am\\.com|\\.am)/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)");
+
+    /** La publicación existe pero no trae video: no tiene caso seguir intentando. */
+    private static final class NoVideo extends Exception {
+        NoVideo(String m) { super(m); }
+    }
 
     private static String igShortcode(String url) {
-        Matcher m = Pattern.compile("instagr(?:am\\.com|\\.am)/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)").matcher(url);
+        Matcher m = IG_CODE.matcher(url);
         return m.find() ? m.group(1) : null;
     }
 
     private static List<String[]> fetchInstagram(String url) throws Exception {
         if (url.contains("/stories/")) throw new Exception("Las historias requieren iniciar sesión; no son compatibles.");
+
+        // Los enlaces instagram.com/share/... son cortos: hay que seguir la redirección
+        if (url.contains("/share/")) {
+            Resp r = request("GET", url, null, new String[][]{{"User-Agent", IG_UA}});
+            if (r.finalUrl.contains("/share/") || igShortcode(r.finalUrl) == null) {
+                throw new Exception("No pude abrir ese enlace corto. En Instagram usa ⋯ → Copiar enlace y pégalo aquí.");
+            }
+            url = r.finalUrl;
+        }
+
         String code = igShortcode(url);
         if (code == null) throw new Exception("No reconocí el enlace. Usa uno de un reel o publicación.");
 
-        List<String[]> out = new ArrayList<String[]>();
-        // 1) API GraphQL pública (la que usa la web de Instagram)
-        try {
-            out = igGraphql(code);
-        } catch (Exception ignored) { }
-        // 2) Respaldo: página embed
-        if (out.isEmpty()) {
+        String[] names = {"api", "api2", "embed", "web"};
+        StringBuilder log = new StringBuilder();
+        for (int i = 0; i < names.length; i++) {
             try {
-                out = igEmbed(code);
-            } catch (Exception ignored) { }
+                List<String[]> out;
+                if (i == 0) out = igApi(code);
+                else if (i == 1) out = igApiLsd(code);
+                else if (i == 2) out = igEmbed(code);
+                else out = igWeb(code);
+                if (!out.isEmpty()) return out;
+                log.append(names[i]).append("=sin video; ");
+            } catch (NoVideo e) {
+                throw e;
+            } catch (Exception e) {
+                log.append(names[i]).append("=").append(e.getMessage()).append("; ");
+            }
         }
-        if (out.isEmpty()) {
-            throw new Exception("No encontré video. Puede ser una cuenta privada, una publicación solo de fotos, o Instagram limitó las solicitudes (intenta en unos minutos).");
-        }
-        return out;
+        throw new Exception("Instagram no entregó el video. Puede ser una cuenta privada o un bloqueo temporal "
+            + "(prueba con datos móviles o en unos minutos).\n[" + log.toString().trim() + "]");
     }
 
-    private static List<String[]> igGraphql(String code) throws Exception {
+    private static String[][] igHeaders(String code, String csrf, String cookies) {
+        return new String[][]{
+            {"User-Agent", IG_UA},
+            {"Accept", "*/*"},
+            {"X-IG-App-ID", IG_APP_ID},
+            {"X-ASBD-ID", "198387"},
+            {"X-IG-WWW-Claim", "0"},
+            {"X-Requested-With", "XMLHttpRequest"},
+            {"X-CSRFToken", csrf == null ? "" : csrf},
+            {"Origin", "https://www.instagram.com"},
+            {"Referer", "https://www.instagram.com/p/" + code + "/"},
+            {"Cookie", cookies == null ? "" : cookies},
+        };
+    }
+
+    /** Método 1: pide un csrftoken y consulta GraphQL por GET. */
+    private static List<String[]> igApi(String code) throws Exception {
+        Resp pre = request("GET", "https://i.instagram.com/api/v1/web/get_ruling_for_content/"
+            + "?content_type=MEDIA&target_id=" + igPk(code), null, igHeaders(code, null, null));
+        String csrf = cookieValue(pre.cookies, "csrftoken");
+
+        String vars = "{\"shortcode\":\"" + code + "\",\"child_comment_count\":3,\"fetch_comment_count\":40,"
+            + "\"parent_comment_count\":24,\"has_threaded_comments\":true}";
+        Resp r = request("GET", "https://www.instagram.com/graphql/query/?doc_id=" + IG_DOC_ID
+            + "&variables=" + URLEncoder.encode(vars, "UTF-8"), null, igHeaders(code, csrf, pre.cookies));
+        return igParse(r, code);
+    }
+
+    /** Método 2: GraphQL por POST con token lsd. */
+    private static List<String[]> igApiLsd(String code) throws Exception {
         String vars = "{\"shortcode\":\"" + code + "\",\"fetch_tagged_user_count\":null,"
             + "\"hoisted_comment_id\":null,\"hoisted_reply_id\":null}";
         String body = "variables=" + URLEncoder.encode(vars, "UTF-8")
@@ -488,58 +538,101 @@ public class MainActivity extends Activity {
             {"Content-Type", "application/x-www-form-urlencoded"},
             {"X-IG-App-ID", IG_APP_ID},
             {"X-FB-LSD", IG_LSD},
-            {"X-ASBD-ID", "129477"},
+            {"X-ASBD-ID", "198387"},
             {"Sec-Fetch-Site", "same-origin"},
             {"Origin", "https://www.instagram.com"},
             {"Referer", "https://www.instagram.com/p/" + code + "/"},
         };
-        JSONObject root = new JSONObject(http("POST", "https://www.instagram.com/graphql/query", body, h));
-        JSONObject media = root.getJSONObject("data").optJSONObject("xdt_shortcode_media");
-        List<String[]> out = new ArrayList<String[]>();
-        if (media == null) return out;
+        return igParse(request("POST", "https://www.instagram.com/graphql/query", body, h), code);
+    }
 
+    private static List<String[]> igParse(Resp r, String code) throws Exception {
+        if (r.code >= 400) throw new Exception("HTTP " + r.code + (r.body.contains("login") ? " (pide login)" : ""));
+        JSONObject root;
+        try {
+            root = new JSONObject(r.body);
+        } catch (Exception e) {
+            throw new Exception("respuesta no JSON");
+        }
+        JSONObject data = root.optJSONObject("data");
+        JSONObject media = data == null ? null : data.optJSONObject("xdt_shortcode_media");
+        if (media == null) {
+            String msg = root.optString("message", "");
+            throw new Exception(msg.isEmpty() ? "sin datos" : msg);
+        }
+
+        List<String[]> out = new ArrayList<String[]>();
+        boolean flagged = false;
         JSONObject side = media.optJSONObject("edge_sidecar_to_children");
         if (side != null) {
             org.json.JSONArray edges = side.optJSONArray("edges");
             int n = 0;
             for (int i = 0; edges != null && i < edges.length(); i++) {
                 JSONObject node = edges.getJSONObject(i).getJSONObject("node");
+                if (!node.optBoolean("is_video")) continue;
+                flagged = true;
                 String v = node.optString("video_url", "");
-                if (node.optBoolean("is_video") && !v.isEmpty()) {
+                if (!v.isEmpty()) {
                     n++;
                     out.add(new String[]{v, "ig_" + code + "_" + n + ".mp4"});
                 }
             }
         } else if (media.optBoolean("is_video")) {
+            flagged = true;
             String v = media.optString("video_url", "");
             if (!v.isEmpty()) out.add(new String[]{v, "ig_" + code + ".mp4"});
         }
+        if (!flagged) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
         return out;
     }
 
+    /** Método 3: página embed. */
     private static List<String[]> igEmbed(String code) throws Exception {
-        String html = http("GET", "https://www.instagram.com/p/" + code + "/embed/captioned/", null,
+        Resp r = request("GET", "https://www.instagram.com/p/" + code + "/embed/captioned/", null,
             new String[][]{{"User-Agent", IG_UA}});
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        return igScrape(r.body, code);
+    }
+
+    /** Método 4: página normal de la publicación. */
+    private static List<String[]> igWeb(String code) throws Exception {
+        Resp r = request("GET", "https://www.instagram.com/reel/" + code + "/", null,
+            new String[][]{{"User-Agent", IG_UA}, {"Accept", "text/html"}});
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        if (r.finalUrl.contains("/accounts/login")) throw new Exception("pide login");
+        return igScrape(r.body, code);
+    }
+
+    private static final Pattern[] IG_HTML = {
+        Pattern.compile("video_url\\\\*\"\\s*:\\s*\\\\*\"(.+?)\\\\*\""),
+        Pattern.compile("video_versions\\\\*\"\\s*:\\s*\\[\\s*\\{.{0,400}?\\\\*\"url\\\\*\"\\s*:\\s*\\\\*\"(.+?)\\\\*\""),
+        Pattern.compile("property=\"og:video(?::secure_url)?\"\\s+content=\"(.+?)\""),
+    };
+
+    private static List<String[]> igScrape(String html, String code) {
         List<String[]> out = new ArrayList<String[]>();
-        Matcher m = Pattern.compile("video_url\\\\?\"\\s*:\\s*\\\\?\"(.+?)\\\\?\"").matcher(html);
-        int n = 0;
         List<String> seen = new ArrayList<String>();
-        while (m.find()) {
-            String v = unescape(m.group(1));
-            if (!v.startsWith("http") || seen.contains(v)) continue;
-            seen.add(v);
-            n++;
-            out.add(new String[]{v, "ig_" + code + (n > 1 ? "_" + n : "") + ".mp4"});
+        for (Pattern p : IG_HTML) {
+            Matcher m = p.matcher(html);
+            while (m.find()) {
+                String v = unescape(m.group(1));
+                if (!v.startsWith("http")) continue;
+                String key = v.contains("?") ? v.substring(0, v.indexOf('?')) : v;
+                if (seen.contains(key)) continue;
+                seen.add(key);
+                out.add(new String[]{v, "ig_" + code + (seen.size() > 1 ? "_" + seen.size() : "") + ".mp4"});
+            }
+            if (!out.isEmpty()) break;
         }
         return out;
     }
 
-    /** Quita los escapes JSON (\\/ , \\u0026, y doble escape dentro de HTML). */
+    /** Quita los escapes JSON (\/ y \u0026), aunque vengan escapados varias veces. */
     private static String unescape(String s) {
         String r = s;
-        for (int i = 0; i < 2 && r.contains("\\"); i++) {
+        for (int i = 0; i < 3 && r.contains("\\"); i++) {
             try {
-                r = new JSONObject("{\"u\":\"" + r.replace("\"", "\\\"") + "\"}").getString("u");
+                r = new JSONObject("{\"u\":\"" + r.replace("\"", "") + "\"}").getString("u");
             } catch (Exception e) {
                 break;
             }
@@ -547,32 +640,83 @@ public class MainActivity extends Activity {
         return r.replace("&amp;", "&");
     }
 
+    /** Convierte el shortcode (base64 de Instagram) al id numérico. */
+    private static String igPk(String code) {
+        String abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        if (code.length() > 28) code = code.substring(0, code.length() - 28);
+        java.math.BigInteger n = java.math.BigInteger.ZERO;
+        java.math.BigInteger b = java.math.BigInteger.valueOf(64);
+        for (int i = 0; i < code.length(); i++) {
+            n = n.multiply(b).add(java.math.BigInteger.valueOf(Math.max(0, abc.indexOf(code.charAt(i)))));
+        }
+        return n.toString();
+    }
+
+    private static String cookieValue(String cookies, String name) {
+        if (cookies == null) return null;
+        for (String part : cookies.split(";\\s*")) {
+            if (part.startsWith(name + "=")) return part.substring(name.length() + 1);
+        }
+        return null;
+    }
+
     // ---------- Red ----------
 
-    private static String http(String method, String u, String body, String[][] headers) throws Exception {
+    private static final class Resp {
+        int code;
+        String body = "";
+        String cookies = "";
+        String finalUrl = "";
+    }
+
+    /** Petición HTTP que no lanza error por códigos 4xx/5xx; devuelve cuerpo, cookies y URL final. */
+    private static Resp request(String method, String u, String body, String[][] headers) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(15000);
         c.setReadTimeout(20000);
         c.setRequestProperty("User-Agent", UA);
-        if (headers != null) for (String[] h : headers) c.setRequestProperty(h[0], h[1]);
+        if (headers != null) {
+            for (String[] h : headers) if (!h[1].isEmpty()) c.setRequestProperty(h[0], h[1]);
+        }
         if (body != null) {
             c.setDoOutput(true);
             OutputStream os = c.getOutputStream();
             os.write(body.getBytes("UTF-8"));
             os.close();
         }
-        int code = c.getResponseCode();
-        InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-        if (in == null) throw new Exception("HTTP " + code);
-        BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = r.readLine()) != null) sb.append(line).append('\n');
-        r.close();
+        Resp r = new Resp();
+        r.code = c.getResponseCode();
+        r.finalUrl = c.getURL().toString();
+
+        StringBuilder ck = new StringBuilder();
+        for (java.util.Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
+            if (e.getKey() == null || !e.getKey().equalsIgnoreCase("Set-Cookie")) continue;
+            for (String v : e.getValue()) {
+                String pair = v.contains(";") ? v.substring(0, v.indexOf(';')) : v;
+                if (ck.length() > 0) ck.append("; ");
+                ck.append(pair);
+            }
+        }
+        r.cookies = ck.toString();
+
+        InputStream in = r.code >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (in != null) {
+            BufferedReader br = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            br.close();
+            r.body = sb.toString();
+        }
         c.disconnect();
-        if (code >= 400) throw new Exception("HTTP " + code);
-        return sb.toString();
+        return r;
+    }
+
+    private static String http(String method, String u, String body, String[][] headers) throws Exception {
+        Resp r = request(method, u, body, headers);
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        return r.body;
     }
 
     private void enqueue(String videoUrl, String folder, String name) {
