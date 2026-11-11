@@ -1,5 +1,6 @@
 package com.isa.tiktokdl;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
@@ -15,53 +16,73 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.media.MediaMetadataRetriever;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
 import android.text.InputType;
+import android.text.TextUtils;
+import android.util.LruCache;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.webkit.CookieManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.AdapterView;
+import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.GridView;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.MediaController;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.VideoView;
 
-import org.json.JSONObject;
-
-import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
-import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
-    private static final String UA =
-        "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36";
     private static final int PICK_BG = 42;
+    private static final int REQ_READ = 43;
     private static final int PINK = 0xFFFE2C55;
     private static final int CYAN = 0xFF25F4EE;
+
+    // Carpeta en Descargas e id de sesión de cada red (mismo orden)
+    private static final String[] NETS = {"TikTok", "Instagram", "X", "Facebook"};
+    private static final String[] NET_IDS = {"tt", "ig", "x", "fb"};
+    // id, nombre, página de login, dominio de las cookies, cookie que indica sesión iniciada
+    private static final String[][] ACCOUNTS = {
+        {"ig", "Instagram", "https://www.instagram.com/accounts/login/", "https://www.instagram.com", "sessionid="},
+        {"fb", "Facebook", "https://m.facebook.com/login/", "https://www.facebook.com", "c_user="},
+        {"x", "X", "https://x.com/i/flow/login", "https://x.com", "auth_token="},
+        {"tt", "TikTok", "https://www.tiktok.com/login/phone-or-email/email", "https://www.tiktok.com", "sessionid="},
+    };
 
     // id, nombre, color inicio, color fin
     private static final String[][] BGS = {
@@ -85,6 +106,8 @@ public class MainActivity extends Activity {
     private boolean dark;
     private int cText, cSub, cCard, cField;
 
+    private int tab;            // 0 = descargar, 1 = biblioteca
+    private String libKey;      // carpeta abierta en la biblioteca ("Red/usuario"), o null
     private EditText input;
     private TextView btnDownload, status;
     private ProgressBar progress;
@@ -104,11 +127,29 @@ public class MainActivity extends Activity {
         handleIntent(intent);
     }
 
+    @Override
+    public void onBackPressed() {
+        if (tab == 1 && libKey != null) {
+            libKey = null;
+            buildUi();
+        } else if (tab == 1) {
+            tab = 0;
+            buildUi();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        if (requestCode == REQ_READ) buildUi();
+    }
+
     // ---------- Interfaz ----------
 
     private void buildUi() {
         String keepText = input != null ? input.getText().toString() : "";
-        CharSequence keepStatus = status != null ? status.getText() : null;
+        String keepStatus = status != null ? status.getText().toString() : null;
 
         dark = !"light".equals(prefs.getString("theme", "dark"));
         cText = dark ? 0xFFFFFFFF : 0xFF141418;
@@ -119,17 +160,14 @@ public class MainActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         int barColor = applyBackground(root);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(20), dp(28), dp(20), dp(24));
-        scroll.addView(col);
-        root.addView(scroll);
+        LinearLayout shell = new LinearLayout(this);
+        shell.setOrientation(LinearLayout.VERTICAL);
+        root.addView(shell, new FrameLayout.LayoutParams(-1, -1));
 
         // Encabezado
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(20), dp(24), dp(20), dp(4));
         ImageView logo = new ImageView(this);
         logo.setImageResource(iconRes(currentIcon()[1]));
         header.addView(logo, new LinearLayout.LayoutParams(dp(44), dp(44)));
@@ -146,10 +184,58 @@ public class MainActivity extends Activity {
             public void onClick(View v) { openSettings(); }
         });
         header.addView(gear, new LinearLayout.LayoutParams(dp(44), dp(44)));
-        col.addView(header);
+        shell.addView(header);
+
+        // Contenido de la pestaña
+        View page = tab == 0 ? downloadPage(keepText, keepStatus) : libraryPage();
+        shell.addView(page, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        // Barra inferior
+        LinearLayout nav = new LinearLayout(this);
+        nav.setBackground(rounded(cCard, 26));
+        nav.setPadding(dp(6), dp(6), dp(6), dp(6));
+        nav.addView(navButton("↓  Descargar", 0), new LinearLayout.LayoutParams(0, -2, 1));
+        nav.addView(navButton("▦  Biblioteca", 1), new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(-1, -2);
+        nlp.setMargins(dp(20), dp(8), dp(20), dp(16));
+        shell.addView(nav, nlp);
+
+        setContentView(root);
+
+        getWindow().setStatusBarColor(barColor);
+        getWindow().setNavigationBarColor(barColor);
+        if (Build.VERSION.SDK_INT >= 23 && !dark) {
+            root.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        }
+    }
+
+    private TextView navButton(String label, final int target) {
+        boolean on = tab == target;
+        TextView t = text(label, 14, on ? Color.WHITE : cSub, true);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(10), dp(11), dp(10), dp(11));
+        t.setBackground(ripple(rounded(on ? PINK : Color.TRANSPARENT, 20), 0x33FFFFFF));
+        t.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (tab == target && libKey == null) return;
+                tab = target;
+                libKey = null;
+                buildUi();
+            }
+        });
+        return t;
+    }
+
+    private View downloadPage(String keepText, String keepStatus) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(20), 0, dp(20), dp(12));
+        scroll.addView(col);
 
         TextView sub = text("TikTok, Instagram, X y Facebook", 14, cSub, false);
-        sub.setPadding(0, dp(6), 0, 0);
+        sub.setPadding(0, dp(2), 0, 0);
         col.addView(sub);
 
         // Tarjeta principal
@@ -158,7 +244,7 @@ public class MainActivity extends Activity {
         card.setBackground(rounded(cCard, 24));
         card.setPadding(dp(18), dp(18), dp(18), dp(18));
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2);
-        clp.topMargin = dp(28);
+        clp.topMargin = dp(24);
         col.addView(card, clp);
 
         card.addView(text("Enlace del video", 13, cSub, true));
@@ -199,12 +285,11 @@ public class MainActivity extends Activity {
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setIndeterminate(true);
         progress.setIndeterminateTintList(ColorStateList.valueOf(CYAN));
-        progress.setVisibility(busy ? View.VISIBLE : View.GONE);
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, dp(6));
         plp.topMargin = dp(14);
         card.addView(progress, plp);
 
-        status = text(keepStatus != null ? keepStatus.toString()
+        status = text(keepStatus != null ? keepStatus
             : "Tip: en la app del video toca Compartir → TikTok DL", 14, cSub, false);
         status.setPadding(0, dp(10), 0, 0);
         card.addView(status);
@@ -215,14 +300,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(-1, -2);
         flp.topMargin = dp(20);
         col.addView(foot, flp);
-
-        setContentView(root);
-
-        getWindow().setStatusBarColor(barColor);
-        getWindow().setNavigationBarColor(barColor);
-        if (Build.VERSION.SDK_INT >= 23 && !dark) {
-            root.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
-        }
+        return scroll;
     }
 
     /** Pone el fondo elegido y devuelve el color para las barras del sistema. */
@@ -296,21 +374,29 @@ public class MainActivity extends Activity {
         }
         v.addView(hscroll(icons));
 
-        // Cuenta de Instagram
-        v.addView(section("Cuenta de Instagram"));
-        final boolean logged = prefs.getString("igCookies", "").contains("sessionid=");
-        LinearLayout acc = new LinearLayout(this);
-        acc.addView(chip(logged ? "Cerrar sesión" : "Iniciar sesión", !logged, new Runnable() {
-            public void run() {
-                if (logged) igLogout(); else igLogin();
-            }
-        }));
-        v.addView(acc);
-        TextView note = text(logged
-            ? "Sesión activa: permite reels, historias y cuentas privadas que sigues."
-            : "Necesaria cuando Instagram pide login. La contraseña se escribe en la página oficial de Instagram; "
-              + "aquí solo se guarda la cookie de sesión en tu teléfono. Recomendado: usar una cuenta secundaria.",
-            12, cSub, false);
+        // Cuentas
+        v.addView(section("Cuentas (para videos privados)"));
+        for (final String[] acc : ACCOUNTS) {
+            final boolean logged = cookies(acc[0]) != null;
+            LinearLayout row = new LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dp(4), 0, dp(4));
+            LinearLayout info = new LinearLayout(this);
+            info.setOrientation(LinearLayout.VERTICAL);
+            info.addView(text(acc[1], 15, cText, true));
+            info.addView(text(logged ? "Sesión activa" : "Sin sesión", 12, logged ? CYAN : cSub, false));
+            row.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+            row.addView(chip(logged ? "Cerrar sesión" : "Iniciar sesión", !logged, new Runnable() {
+                public void run() {
+                    if (logged) logout(acc); else login(acc);
+                }
+            }));
+            v.addView(row);
+        }
+        TextView note = text("Solo hace falta para cuentas privadas que sigues, historias, o cuando la red pide "
+            + "login. La contraseña se escribe en la página oficial; aquí solo se guarda la cookie de sesión en tu "
+            + "teléfono. Entra con usuario y contraseña (el botón de Google no funciona aquí). "
+            + "Recomendado: cuentas secundarias.", 12, cSub, false);
         note.setPadding(0, dp(8), 0, 0);
         v.addView(note);
 
@@ -390,9 +476,18 @@ public class MainActivity extends Activity {
         return BGS[0];
     }
 
-    // ---------- Sesión de Instagram ----------
+    // ---------- Sesiones ----------
 
-    private void igLogin() {
+    /** Cookies guardadas de una red, o null si no hay sesión. */
+    private String cookies(String id) {
+        String c = prefs.getString(id + "Cookies", "");
+        for (String[] acc : ACCOUNTS) {
+            if (acc[0].equals(id)) return c.contains(acc[4]) ? c : null;
+        }
+        return null;
+    }
+
+    private void login(final String[] acc) {
         if (settingsDialog != null) settingsDialog.dismiss();
         final Dialog d = new Dialog(this, android.R.style.Theme_Material_NoActionBar);
         final WebView w = new WebView(this);
@@ -404,46 +499,54 @@ public class MainActivity extends Activity {
         final CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(w, true);
-        w.setWebViewClient(new WebViewClient() {
-            boolean saved;
+        w.setWebViewClient(new WebViewClient());
 
-            void check() {
-                String c = cm.getCookie("https://www.instagram.com");
-                if (saved || c == null || !c.contains("sessionid=")) return;
-                saved = true;
-                prefs.edit().putString("igCookies", c).putString("igUa", ua).apply();
-                cm.flush();
-                d.dismiss();
-                toast("Sesión de Instagram guardada");
+        // Revisa cada segundo si ya apareció la cookie de sesión
+        final Handler handler = new Handler();
+        final Runnable check = new Runnable() {
+            public void run() {
+                if (!d.isShowing()) return;
+                String c = cm.getCookie(acc[3]);
+                if (c != null && c.contains(acc[4])) {
+                    prefs.edit().putString(acc[0] + "Cookies", c).putString(acc[0] + "Ua", ua).apply();
+                    cm.flush();
+                    d.dismiss();
+                    toast("Sesión de " + acc[1] + " guardada");
+                    return;
+                }
+                handler.postDelayed(this, 1000);
             }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                check();
-            }
-
-            @Override
-            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
-                check();
-            }
-        });
+        };
         d.setContentView(w, new ViewGroup.LayoutParams(-1, -1));
         d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
             public void onDismiss(android.content.DialogInterface di) {
+                handler.removeCallbacks(check);
                 w.stopLoading();
                 w.destroy();
             }
         });
         d.show();
-        w.loadUrl("https://www.instagram.com/accounts/login/");
+        w.loadUrl(acc[2]);
+        handler.postDelayed(check, 1500);
+        toast("Inicia sesión; la ventana se cierra sola al terminar");
     }
 
-    private void igLogout() {
-        prefs.edit().remove("igCookies").remove("igUa").apply();
+    private void logout(String[] acc) {
+        prefs.edit().remove(acc[0] + "Cookies").remove(acc[0] + "Ua").apply();
+        // Caduca las cookies de ese dominio en el navegador interno
         CookieManager cm = CookieManager.getInstance();
-        cm.removeAllCookies(null);
+        String all = cm.getCookie(acc[3]);
+        String host = Uri.parse(acc[3]).getHost();
+        if (host.startsWith("www.")) host = host.substring(4);
+        if (all != null) {
+            for (String part : all.split(";\\s*")) {
+                String name = part.split("=", 2)[0];
+                cm.setCookie(acc[3], name + "=; Max-Age=0; Path=/; Domain=." + host);
+                cm.setCookie(acc[3], name + "=; Max-Age=0; Path=/");
+            }
+        }
         cm.flush();
-        toast("Sesión cerrada");
+        toast("Sesión de " + acc[1] + " cerrada");
         refreshSettings();
     }
 
@@ -453,6 +556,11 @@ public class MainActivity extends Activity {
         if (i != null && Intent.ACTION_SEND.equals(i.getAction())) {
             String url = extractUrl(i.getStringExtra(Intent.EXTRA_TEXT));
             if (url != null) {
+                if (tab != 0) {
+                    tab = 0;
+                    libKey = null;
+                    buildUi();
+                }
                 input.setText(url);
                 download();
             }
@@ -482,31 +590,38 @@ public class MainActivity extends Activity {
         final int kind = url == null ? -1
             : url.contains("tiktok.com") ? 0
             : (url.contains("instagram.com") || url.contains("instagr.am")) ? 1
-            : (X_ID.matcher(url).find() || url.contains("//t.co/")) ? 2
+            : (Net.X_ID.matcher(url).find() || url.contains("//t.co/")) ? 2
             : (url.contains("facebook.com") || url.contains("fb.watch") || url.contains("//fb.com/")) ? 3 : -1;
         if (kind < 0) {
             status.setText("Enlace no válido. Usa un enlace de TikTok, Instagram, X o Facebook.");
             return;
         }
-        final String[] names = {"TikTok", "Instagram", "X", "Facebook"};
-        final String igCookies = prefs.getString("igCookies", null);
-        final String igUa = prefs.getString("igUa", IG_UA);
+        final String ck = cookies(NET_IDS[kind]);
+        final String ua = prefs.getString(NET_IDS[kind] + "Ua", Net.IG_UA);
         setBusy(true);
-        status.setText("Obteniendo video de " + names[kind] + "…");
+        status.setText("Obteniendo video de " + NETS[kind] + "…");
 
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    List<String[]> items = kind == 0 ? fetchTikTok(url)
-                        : kind == 1 ? fetchInstagram(url, igCookies, igUa)
-                        : kind == 2 ? fetchX(url) : fetchFacebook(url);
-                    String folder = names[kind];
+                    List<String[]> items = kind == 0 ? Net.fetchTikTok(url, ck)
+                        : kind == 1 ? Net.fetchInstagram(url, ck, ua)
+                        : kind == 2 ? Net.fetchX(url, ck) : Net.fetchFacebook(url, ck);
+                    String folder = NETS[kind];
                     for (String[] it : items) {
-                        String user = it.length > 2 ? cleanName(it[2]) : "";
+                        String user = it.length > 2 ? Net.cleanName(it[2]) : "";
                         String file = user.isEmpty() ? it[1]
                             : user + "_" + it[1].replaceFirst("^(tiktok|ig|x|fb)_", "");
-                        folder = names[kind] + (user.isEmpty() ? "" : "/" + user);
-                        enqueue(it[0], folder, file);
+                        folder = NETS[kind] + (user.isEmpty() ? "" : "/" + user);
+                        enqueue(it[0], folder, file, it.length > 4 ? it[4] : "", it.length > 5 ? it[5] : "");
+
+                        // Foto de perfil para la portada de la carpeta
+                        if (!user.isEmpty() && it.length > 3 && it[3].startsWith("http")) {
+                            File av = avatarFile(NETS[kind], user);
+                            if (!av.exists() || System.currentTimeMillis() - av.lastModified() > 7L * 86400000L) {
+                                Net.downloadTo(it[3], av);
+                            }
+                        }
                     }
                     done("✓ Descargando " + (items.size() == 1 ? "video" : items.size() + " videos")
                         + "\nCarpeta: Descargas/" + folder);
@@ -517,646 +632,21 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    // ---------- X / Twitter ----------
-
-    private static final Pattern X_ID = Pattern.compile(
-        "(?:twitter\\.com|[/.]x\\.com)/(?:[^/?#]+/){1,2}status(?:es)?/(\\d+)");
-
-    private static List<String[]> fetchX(String url) throws Exception {
-        if (url.contains("//t.co/")) {
-            url = request("GET", url, null, new String[][]{{"User-Agent", "curl/8.0"}}).finalUrl;
-        }
-        Matcher m = X_ID.matcher(url);
-        if (!m.find()) throw new Exception("No reconocí el enlace. Usa el de un post de X (…/status/123…).");
-        String id = m.group(1);
-        String[] who = {firstGroup(X_USER_URL, url)};
-        if ("i".equals(who[0])) who[0] = "";
-
-        String[] names = {"x", "fx", "vx"};
-        StringBuilder log = new StringBuilder();
-        for (int i = 0; i < names.length; i++) {
-            try {
-                List<String> urls = i == 0 ? xSyndication(id, who) : i == 1 ? xFx(id, who) : xVx(id, who);
-                if (!urls.isEmpty()) {
-                    List<String[]> out = new ArrayList<String[]>();
-                    for (int k = 0; k < urls.size(); k++) {
-                        out.add(new String[]{urls.get(k), "x_" + id + (urls.size() > 1 ? "_" + (k + 1) : "") + ".mp4", who[0]});
-                    }
-                    return out;
-                }
-                log.append(names[i]).append("=sin video; ");
-            } catch (Exception e) {
-                log.append(names[i]).append("=").append(e.getMessage()).append("; ");
-            }
-        }
-        throw new Exception("No encontré video en ese post. Puede ser solo texto o fotos, de una cuenta privada "
-            + "o con restricción de edad.\n[" + log.toString().trim() + "]");
+    private File avatarFile(String net, String user) {
+        return new File(getFilesDir(), "avatars/" + net + "_" + user + ".jpg");
     }
 
-    /** API pública de X para posts incrustados. */
-    private static List<String> xSyndication(String id, String[] who) throws Exception {
-        String abc = "123456789abcdefghijklmnopqrstuvwxyz";
-        StringBuilder tok = new StringBuilder();
-        java.util.Random rnd = new java.util.Random();
-        for (int i = 0; i < 10; i++) tok.append(abc.charAt(rnd.nextInt(abc.length())));
-        Resp r = request("GET", "https://cdn.syndication.twimg.com/tweet-result?id=" + id + "&token=" + tok,
-            null, new String[][]{{"User-Agent", IG_UA}});
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        JSONObject j = new JSONObject(r.body);
-        if ("TweetTombstone".equals(j.optString("__typename", ""))) throw new Exception("restringido");
-        JSONObject xu = j.optJSONObject("user");
-        if (xu != null && !xu.optString("screen_name", "").isEmpty()) who[0] = xu.optString("screen_name", "");
-        List<String> out = new ArrayList<String>();
-        org.json.JSONArray md = j.optJSONArray("mediaDetails");
-        for (int i = 0; md != null && i < md.length(); i++) {
-            JSONObject vi = md.getJSONObject(i).optJSONObject("video_info");
-            org.json.JSONArray vars = vi == null ? null : vi.optJSONArray("variants");
-            String best = null;
-            int bestRate = -1;
-            for (int k = 0; vars != null && k < vars.length(); k++) {
-                JSONObject v = vars.getJSONObject(k);
-                if (!"video/mp4".equals(v.optString("content_type", ""))) continue;
-                int rate = v.optInt("bitrate", 0);
-                if (rate > bestRate) {
-                    bestRate = rate;
-                    best = v.optString("url", "");
-                }
-            }
-            if (best != null && !best.isEmpty()) out.add(best);
-        }
-        return out;
-    }
-
-    private static List<String> xFx(String id, String[] who) throws Exception {
-        Resp r = request("GET", "https://api.fxtwitter.com/status/" + id, null,
-            new String[][]{{"User-Agent", "TikTokDL/2.3"}});
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        List<String> out = new ArrayList<String>();
-        JSONObject tweet = new JSONObject(r.body).optJSONObject("tweet");
-        JSONObject media = tweet == null ? null : tweet.optJSONObject("media");
-        JSONObject fa = tweet == null ? null : tweet.optJSONObject("author");
-        if (fa != null && !fa.optString("screen_name", "").isEmpty()) who[0] = fa.optString("screen_name", "");
-        org.json.JSONArray vids = media == null ? null : media.optJSONArray("videos");
-        for (int i = 0; vids != null && i < vids.length(); i++) {
-            String v = vids.getJSONObject(i).optString("url", "");
-            if (v.startsWith("http")) out.add(v);
-        }
-        return out;
-    }
-
-    private static List<String> xVx(String id, String[] who) throws Exception {
-        Resp r = request("GET", "https://api.vxtwitter.com/Twitter/status/" + id, null,
-            new String[][]{{"User-Agent", "TikTokDL/2.3"}});
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        List<String> out = new ArrayList<String>();
-        JSONObject vj = new JSONObject(r.body);
-        if (!vj.optString("user_screen_name", "").isEmpty()) who[0] = vj.optString("user_screen_name", "");
-        org.json.JSONArray me = vj.optJSONArray("media_extended");
-        for (int i = 0; me != null && i < me.length(); i++) {
-            JSONObject o = me.getJSONObject(i);
-            String type = o.optString("type", "");
-            String v = o.optString("url", "");
-            if (("video".equals(type) || "gif".equals(type)) && v.startsWith("http")) out.add(v);
-        }
-        return out;
-    }
-
-    // ---------- TikTok ----------
-
-    private static List<String[]> fetchTikTok(String url) throws Exception {
-        String api = "https://www.tikwm.com/api/?hd=1&url=" + URLEncoder.encode(url, "UTF-8");
-        JSONObject j = new JSONObject(http("GET", api, null, null));
-        if (j.optInt("code", -1) != 0) {
-            throw new Exception(j.optString("msg", "La API no respondió bien"));
-        }
-        JSONObject d = j.getJSONObject("data");
-        String video = d.optString("hdplay", "");
-        if (video.isEmpty()) video = d.optString("play", "");
-        if (video.isEmpty()) throw new Exception("No hay video (¿es un carrusel de fotos?)");
-        if (video.startsWith("/")) video = "https://www.tikwm.com" + video;
-
-        List<String[]> out = new ArrayList<String[]>();
-        out.add(new String[]{video, "tiktok_" + d.optString("id", String.valueOf(System.currentTimeMillis())) + ".mp4"});
-        JSONObject author = d.optJSONObject("author");
-        return withUser(out, author == null ? "" : author.optString("unique_id", ""));
-    }
-
-    // ---------- Instagram ----------
-
-    private static final String IG_UA =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-    private static final String IG_APP_ID = "936619743392459";
-    private static final String IG_DOC_ID = "8845758582119845";
-    private static final String IG_LSD = "AVqbxe3J_YA";
-    private static final Pattern IG_CODE = Pattern.compile(
-        "instagr(?:am\\.com|\\.am)/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)");
-
-    /** La publicación existe pero no trae video: no tiene caso seguir intentando. */
-    private static final class NoVideo extends Exception {
-        NoVideo(String m) { super(m); }
-    }
-
-    private static String igShortcode(String url) {
-        Matcher m = IG_CODE.matcher(url);
-        return m.find() ? m.group(1) : null;
-    }
-
-    private static final Pattern IG_STORY = Pattern.compile("instagram\\.com/stories/[^/?#]+/(\\d+)");
-
-    private static List<String[]> fetchInstagram(String url, String cookies, String ua) throws Exception {
-        boolean logged = cookies != null && cookies.contains("sessionid=");
-
-        Matcher st = IG_STORY.matcher(url);
-        if (st.find()) {
-            if (!logged) throw new Exception("Las historias requieren sesión. Ve a ⚙ → Iniciar sesión en Instagram.");
-            try {
-                return igAuth(st.group(1), "story_" + st.group(1), cookies, ua);
-            } catch (NoVideo e) {
-                throw new Exception("Esa historia es una foto, no un video.");
-            }
-        }
-        if (url.contains("/stories/")) throw new Exception("Abre la historia y copia el enlace de esa historia en concreto.");
-
-        // Los enlaces instagram.com/share/... son cortos: hay que seguir la redirección
-        if (url.contains("/share/")) {
-            Resp r = request("GET", url, null, new String[][]{
-                {"User-Agent", logged ? ua : IG_UA}, {"Cookie", logged ? cookies : ""}});
-            if (r.finalUrl.contains("/share/") || igShortcode(r.finalUrl) == null) {
-                throw new Exception("No pude abrir ese enlace corto. En Instagram usa ⋯ → Copiar enlace y pégalo aquí.");
-            }
-            url = r.finalUrl;
-        }
-
-        String code = igShortcode(url);
-        if (code == null) throw new Exception("No reconocí el enlace. Usa uno de un reel o publicación.");
-
-        StringBuilder log = new StringBuilder();
-        if (logged) {
-            try {
-                List<String[]> out = igAuth(igPk(code), code, cookies, ua);
-                if (!out.isEmpty()) return out;
-                log.append("sesion=sin video; ");
-            } catch (NoVideo e) {
-                throw e;
-            } catch (Exception e) {
-                log.append("sesion=").append(e.getMessage()).append("; ");
-            }
-        }
-
-        String[] names = {"api", "api2", "embed", "web"};
-        for (int i = 0; i < names.length; i++) {
-            try {
-                List<String[]> out;
-                if (i == 0) out = igApi(code);
-                else if (i == 1) out = igApiLsd(code);
-                else if (i == 2) out = igEmbed(code);
-                else out = igWeb(code);
-                if (!out.isEmpty()) return out;
-                log.append(names[i]).append("=sin video; ");
-            } catch (NoVideo e) {
-                throw e;
-            } catch (Exception e) {
-                log.append(names[i]).append("=").append(e.getMessage()).append("; ");
-            }
-        }
-        throw new Exception((logged
-            ? "Instagram no entregó el video ni con tu sesión. Si dice que caducó, cierra sesión y vuelve a entrar en ⚙."
-            : "Instagram pide iniciar sesión para este video. Ve a ⚙ → Iniciar sesión en Instagram.")
-            + "\n[" + log.toString().trim() + "]");
-    }
-
-    /** Con sesión iniciada: API de medios, igual que la web de Instagram. */
-    private static List<String[]> igAuth(String pk, String label, String cookies, String ua) throws Exception {
-        String csrf = cookieValue(cookies, "csrftoken");
-        String[][] h = {
-            {"User-Agent", ua},
-            {"Accept", "*/*"},
-            {"X-IG-App-ID", IG_APP_ID},
-            {"X-ASBD-ID", "198387"},
-            {"X-IG-WWW-Claim", "0"},
-            {"X-Requested-With", "XMLHttpRequest"},
-            {"X-CSRFToken", csrf == null ? "" : csrf},
-            {"Origin", "https://www.instagram.com"},
-            {"Referer", "https://www.instagram.com/"},
-            {"Cookie", cookies},
-        };
-        Resp r = request("GET", "https://i.instagram.com/api/v1/media/" + pk + "/info/", null, h);
-        if (r.code >= 400) {
-            Resp r2 = request("GET", "https://www.instagram.com/api/v1/media/" + pk + "/info/", null, h);
-            if (r2.code < 400) r = r2;
-        }
-        if (r.code == 401 || r.code == 403 || r.body.contains("login_required")) {
-            throw new Exception("sesión caducada (HTTP " + r.code + ")");
-        }
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-
-        org.json.JSONArray items;
-        try {
-            items = new JSONObject(r.body).optJSONArray("items");
-        } catch (Exception e) {
-            throw new Exception("respuesta no JSON");
-        }
-        if (items == null || items.length() == 0) throw new Exception("sin datos");
-        JSONObject it = items.getJSONObject(0);
-
-        List<String[]> out = new ArrayList<String[]>();
-        org.json.JSONArray car = it.optJSONArray("carousel_media");
-        if (car != null) {
-            int n = 0;
-            for (int i = 0; i < car.length(); i++) {
-                String v = igBestVersion(car.getJSONObject(i));
-                if (v != null) {
-                    n++;
-                    out.add(new String[]{v, "ig_" + label + "_" + n + ".mp4"});
-                }
-            }
-        } else {
-            String v = igBestVersion(it);
-            if (v != null) out.add(new String[]{v, "ig_" + label + ".mp4"});
-        }
-        if (out.isEmpty()) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
-        JSONObject owner = it.optJSONObject("user");
-        return withUser(out, owner == null ? "" : owner.optString("username", ""));
-    }
-
-    private static String igBestVersion(JSONObject media) throws Exception {
-        org.json.JSONArray vv = media.optJSONArray("video_versions");
-        String best = null;
-        int bestW = -1;
-        for (int i = 0; vv != null && i < vv.length(); i++) {
-            JSONObject v = vv.getJSONObject(i);
-            String u = v.optString("url", "");
-            int w = v.optInt("width", 0);
-            if (!u.isEmpty() && w > bestW) {
-                bestW = w;
-                best = u;
-            }
-        }
-        return best;
-    }
-
-    private static String[][] igHeaders(String code, String csrf, String cookies) {
-        return new String[][]{
-            {"User-Agent", IG_UA},
-            {"Accept", "*/*"},
-            {"X-IG-App-ID", IG_APP_ID},
-            {"X-ASBD-ID", "198387"},
-            {"X-IG-WWW-Claim", "0"},
-            {"X-Requested-With", "XMLHttpRequest"},
-            {"X-CSRFToken", csrf == null ? "" : csrf},
-            {"Origin", "https://www.instagram.com"},
-            {"Referer", "https://www.instagram.com/p/" + code + "/"},
-            {"Cookie", cookies == null ? "" : cookies},
-        };
-    }
-
-    /** Método 1: pide un csrftoken y consulta GraphQL por GET. */
-    private static List<String[]> igApi(String code) throws Exception {
-        Resp pre = request("GET", "https://i.instagram.com/api/v1/web/get_ruling_for_content/"
-            + "?content_type=MEDIA&target_id=" + igPk(code), null, igHeaders(code, null, null));
-        String csrf = cookieValue(pre.cookies, "csrftoken");
-
-        String vars = "{\"shortcode\":\"" + code + "\",\"child_comment_count\":3,\"fetch_comment_count\":40,"
-            + "\"parent_comment_count\":24,\"has_threaded_comments\":true}";
-        Resp r = request("GET", "https://www.instagram.com/graphql/query/?doc_id=" + IG_DOC_ID
-            + "&variables=" + URLEncoder.encode(vars, "UTF-8"), null, igHeaders(code, csrf, pre.cookies));
-        return igParse(r, code);
-    }
-
-    /** Método 2: GraphQL por POST con token lsd. */
-    private static List<String[]> igApiLsd(String code) throws Exception {
-        String vars = "{\"shortcode\":\"" + code + "\",\"fetch_tagged_user_count\":null,"
-            + "\"hoisted_comment_id\":null,\"hoisted_reply_id\":null}";
-        String body = "variables=" + URLEncoder.encode(vars, "UTF-8")
-            + "&doc_id=" + IG_DOC_ID + "&lsd=" + IG_LSD;
-        String[][] h = {
-            {"User-Agent", IG_UA},
-            {"Content-Type", "application/x-www-form-urlencoded"},
-            {"X-IG-App-ID", IG_APP_ID},
-            {"X-FB-LSD", IG_LSD},
-            {"X-ASBD-ID", "198387"},
-            {"Sec-Fetch-Site", "same-origin"},
-            {"Origin", "https://www.instagram.com"},
-            {"Referer", "https://www.instagram.com/p/" + code + "/"},
-        };
-        return igParse(request("POST", "https://www.instagram.com/graphql/query", body, h), code);
-    }
-
-    private static List<String[]> igParse(Resp r, String code) throws Exception {
-        if (r.code >= 400) throw new Exception("HTTP " + r.code + (r.body.contains("login") ? " (pide login)" : ""));
-        JSONObject root;
-        try {
-            root = new JSONObject(r.body);
-        } catch (Exception e) {
-            throw new Exception("respuesta no JSON");
-        }
-        JSONObject data = root.optJSONObject("data");
-        JSONObject media = data == null ? null : data.optJSONObject("xdt_shortcode_media");
-        if (media == null) {
-            String msg = root.optString("message", "");
-            throw new Exception(msg.isEmpty() ? "sin datos" : msg);
-        }
-
-        List<String[]> out = new ArrayList<String[]>();
-        boolean flagged = false;
-        JSONObject side = media.optJSONObject("edge_sidecar_to_children");
-        if (side != null) {
-            org.json.JSONArray edges = side.optJSONArray("edges");
-            int n = 0;
-            for (int i = 0; edges != null && i < edges.length(); i++) {
-                JSONObject node = edges.getJSONObject(i).getJSONObject("node");
-                if (!node.optBoolean("is_video")) continue;
-                flagged = true;
-                String v = node.optString("video_url", "");
-                if (!v.isEmpty()) {
-                    n++;
-                    out.add(new String[]{v, "ig_" + code + "_" + n + ".mp4"});
-                }
-            }
-        } else if (media.optBoolean("is_video")) {
-            flagged = true;
-            String v = media.optString("video_url", "");
-            if (!v.isEmpty()) out.add(new String[]{v, "ig_" + code + ".mp4"});
-        }
-        if (!flagged) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
-        JSONObject owner = media.optJSONObject("owner");
-        return withUser(out, owner == null ? "" : owner.optString("username", ""));
-    }
-
-    /** Método 3: página embed. */
-    private static List<String[]> igEmbed(String code) throws Exception {
-        Resp r = request("GET", "https://www.instagram.com/p/" + code + "/embed/captioned/", null,
-            new String[][]{{"User-Agent", IG_UA}});
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        return igScrape(r.body, code);
-    }
-
-    /** Método 4: página normal de la publicación. */
-    private static List<String[]> igWeb(String code) throws Exception {
-        Resp r = request("GET", "https://www.instagram.com/reel/" + code + "/", null,
-            new String[][]{{"User-Agent", IG_UA}, {"Accept", "text/html"}});
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        if (r.finalUrl.contains("/accounts/login")) throw new Exception("pide login");
-        return igScrape(r.body, code);
-    }
-
-    private static final Pattern[] IG_HTML = {
-        Pattern.compile("video_url\\\\*\"\\s*:\\s*\\\\*\"(.+?)\\\\*\""),
-        Pattern.compile("video_versions\\\\*\"\\s*:\\s*\\[\\s*\\{.{0,400}?\\\\*\"url\\\\*\"\\s*:\\s*\\\\*\"(.+?)\\\\*\""),
-        Pattern.compile("property=\"og:video(?::secure_url)?\"\\s+content=\"(.+?)\""),
-    };
-
-    private static List<String[]> igScrape(String html, String code) {
-        List<String[]> out = new ArrayList<String[]>();
-        List<String> seen = new ArrayList<String>();
-        for (Pattern p : IG_HTML) {
-            Matcher m = p.matcher(html);
-            while (m.find()) {
-                String v = unescape(m.group(1));
-                if (!v.startsWith("http")) continue;
-                String key = v.contains("?") ? v.substring(0, v.indexOf('?')) : v;
-                if (seen.contains(key)) continue;
-                seen.add(key);
-                out.add(new String[]{v, "ig_" + code + (seen.size() > 1 ? "_" + seen.size() : "") + ".mp4"});
-            }
-            if (!out.isEmpty()) break;
-        }
-        return withUser(out, firstGroup(IG_USER_HTML, html));
-    }
-
-    /** Quita los escapes JSON (\/ y \u0026), aunque vengan escapados varias veces. */
-    private static String unescape(String s) {
-        String r = s;
-        for (int i = 0; i < 3 && r.contains("\\"); i++) {
-            try {
-                r = new JSONObject("{\"u\":\"" + r.replace("\"", "") + "\"}").getString("u");
-            } catch (Exception e) {
-                break;
-            }
-        }
-        return r.replace("&amp;", "&");
-    }
-
-    /** Convierte el shortcode (base64 de Instagram) al id numérico. */
-    private static String igPk(String code) {
-        String abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        if (code.length() > 28) code = code.substring(0, code.length() - 28);
-        java.math.BigInteger n = java.math.BigInteger.ZERO;
-        java.math.BigInteger b = java.math.BigInteger.valueOf(64);
-        for (int i = 0; i < code.length(); i++) {
-            n = n.multiply(b).add(java.math.BigInteger.valueOf(Math.max(0, abc.indexOf(code.charAt(i)))));
-        }
-        return n.toString();
-    }
-
-    private static String cookieValue(String cookies, String name) {
-        if (cookies == null) return null;
-        for (String part : cookies.split(";\\s*")) {
-            if (part.startsWith(name + "=")) return part.substring(name.length() + 1);
-        }
-        return null;
-    }
-
-    // ---------- Facebook ----------
-
-    private static final String[][] FB_HEADERS = {
-        {"User-Agent", IG_UA},
-        {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-        {"Accept-Language", "en-US,en;q=0.9"},
-        {"Sec-Fetch-Dest", "document"},
-        {"Sec-Fetch-Mode", "navigate"},
-        {"Sec-Fetch-Site", "none"},
-        {"Sec-Fetch-User", "?1"},
-        {"Upgrade-Insecure-Requests", "1"},
-    };
-    // De mejor a peor calidad
-    private static final Pattern[] FB_HTML = {
-        Pattern.compile("\"progressive_url\":\"([^\"]+)\",\"failure_reason\":[^,]*,\"metadata\":\\{\"quality\":\"HD\"\\}"),
-        Pattern.compile("\"browser_native_hd_url\":\"([^\"]+)\""),
-        Pattern.compile("\"playable_url_quality_hd\":\"([^\"]+)\""),
-        Pattern.compile("\"?hd_src\"?:\"([^\"]+)\""),
-        Pattern.compile("\"progressive_url\":\"([^\"]+)\""),
-        Pattern.compile("\"browser_native_sd_url\":\"([^\"]+)\""),
-        Pattern.compile("\"playable_url\":\"([^\"]+)\""),
-        Pattern.compile("\"?sd_src(?:_no_ratelimit)?\"?:\"([^\"]+)\""),
-        Pattern.compile("property=\"og:video(?::secure_url|:url)?\"\\s+content=\"([^\"]+)\""),
-    };
-    private static final Pattern FB_VID = Pattern.compile("(?:/videos/(?:[^/?#]+/)?|/reel/|[?&]v=|story_fbid=|/watch/\\?v=)(\\d+)");
-
-    private static String fbScrape(String html) {
-        for (Pattern p : FB_HTML) {
-            Matcher m = p.matcher(html);
-            while (m.find()) {
-                String v = unescape(m.group(1));
-                if (v.startsWith("http")) return v;
-            }
-        }
-        return null;
-    }
-
-    private static List<String[]> fetchFacebook(String url) throws Exception {
-        url = url.replaceFirst("//(?:m|mbasic|web|touch)\\.facebook\\.com", "//www.facebook.com");
-        StringBuilder log = new StringBuilder();
-        String video = null;
-        String owner = "";
-        String page = url;
-
-        // 1) Página del video (también resuelve fb.watch y /share/)
-        try {
-            Resp r = request("GET", url, null, FB_HEADERS);
-            page = r.finalUrl;
-            if (r.code >= 400) log.append("web=HTTP ").append(r.code).append("; ");
-            else {
-                video = fbScrape(r.body);
-                owner = fbOwner(r.body, r.finalUrl);
-                if (video == null) {
-                    log.append(r.finalUrl.contains("/login") || r.body.contains("login_form")
-                        ? "web=pide login; " : "web=sin video; ");
-                }
-            }
-        } catch (Exception e) {
-            log.append("web=").append(e.getMessage()).append("; ");
-        }
-
-        // 2) Reproductor incrustable
-        if (video == null) {
-            try {
-                String target = page.contains("/login") ? url : page;
-                Resp r = request("GET", "https://www.facebook.com/plugins/video.php?show_text=0&href="
-                    + URLEncoder.encode(target, "UTF-8"), null, FB_HEADERS);
-                if (r.code >= 400) log.append("embed=HTTP ").append(r.code).append("; ");
-                else {
-                    video = fbScrape(r.body);
-                    if (owner.isEmpty()) owner = fbOwner(r.body, page);
-                    if (video == null) log.append("embed=sin video; ");
-                }
-            } catch (Exception e) {
-                log.append("embed=").append(e.getMessage()).append("; ");
-            }
-        }
-
-        if (video == null) {
-            throw new Exception("No encontré el video. Puede ser privado, de un grupo cerrado, "
-                + "o Facebook pidió iniciar sesión.\n[" + log.toString().trim() + "]");
-        }
-        Matcher m = FB_VID.matcher(page);
-        String id = m.find() ? m.group(1) : String.valueOf(System.currentTimeMillis());
-        List<String[]> out = new ArrayList<String[]>();
-        out.add(new String[]{video, "fb_" + id + ".mp4", owner});
-        return out;
-    }
-
-    // ---------- Nombre del perfil ----------
-
-    /** Agrega el usuario como tercer dato de cada video. */
-    private static List<String[]> withUser(List<String[]> items, String user) {
-        List<String[]> out = new ArrayList<String[]>();
-        for (String[] it : items) out.add(new String[]{it[0], it[1], user == null ? "" : user});
-        return out;
-    }
-
-    /** Deja el nombre apto para carpeta/archivo. */
-    private static String cleanName(String s) {
-        if (s == null) return "";
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < s.length() && b.length() < 40; i++) {
-            char c = s.charAt(i);
-            if (Character.isLetterOrDigit(c) || c == '.' || c == '-' || c == '_') b.append(c);
-            else if (c == ' ' && b.length() > 0 && b.charAt(b.length() - 1) != '_') b.append('_');
-        }
-        String r = b.toString();
-        while (r.startsWith(".") || r.startsWith("_")) r = r.substring(1);
-        while (r.endsWith(".") || r.endsWith("_")) r = r.substring(0, r.length() - 1);
-        return r;
-    }
-
-    private static String firstGroup(Pattern p, String s) {
-        Matcher m = p.matcher(s);
-        return m.find() ? m.group(1) : "";
-    }
-
-    private static final Pattern IG_USER_HTML = Pattern.compile("\\\\*\"username\\\\*\"\\s*:\\s*\\\\*\"([A-Za-z0-9._]+)\\\\*\"");
-    private static final Pattern X_USER_URL = Pattern.compile("(?:twitter\\.com|[/.]x\\.com)/([A-Za-z0-9_]+)/status");
-    private static final Pattern FB_USER_URL = Pattern.compile("facebook\\.com/([^/?#]+)/(?:videos|posts)/");
-    private static final Pattern[] FB_OWNER = {
-        Pattern.compile("\"owner\":\\{\"__typename\":\"(?:User|Page)\",[^{}]*?\"name\":\"([^\"]+)\""),
-        Pattern.compile("\"video_owner\":\\{[^{}]*?\"name\":\"([^\"]+)\""),
-        Pattern.compile("\"owning_profile\":\\{[^{}]*?\"name\":\"([^\"]+)\""),
-        Pattern.compile("\"actors\":\\[\\{[^{}]*?\"name\":\"([^\"]+)\""),
-    };
-
-    private static String fbOwner(String html, String pageUrl) {
-        for (Pattern p : FB_OWNER) {
-            String n = firstGroup(p, html);
-            if (!n.isEmpty()) return unescape(n);
-        }
-        String u = firstGroup(FB_USER_URL, pageUrl);
-        return "watch".equals(u) || "reel".equals(u) ? "" : u;
-    }
-
-    // ---------- Red ----------
-
-    private static final class Resp {
-        int code;
-        String body = "";
-        String cookies = "";
-        String finalUrl = "";
-    }
-
-    /** Petición HTTP que no lanza error por códigos 4xx/5xx; devuelve cuerpo, cookies y URL final. */
-    private static Resp request(String method, String u, String body, String[][] headers) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
-        c.setRequestMethod(method);
-        c.setConnectTimeout(15000);
-        c.setReadTimeout(20000);
-        c.setRequestProperty("User-Agent", UA);
-        if (headers != null) {
-            for (String[] h : headers) if (!h[1].isEmpty()) c.setRequestProperty(h[0], h[1]);
-        }
-        if (body != null) {
-            c.setDoOutput(true);
-            OutputStream os = c.getOutputStream();
-            os.write(body.getBytes("UTF-8"));
-            os.close();
-        }
-        Resp r = new Resp();
-        r.code = c.getResponseCode();
-        r.finalUrl = c.getURL().toString();
-
-        StringBuilder ck = new StringBuilder();
-        for (java.util.Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
-            if (e.getKey() == null || !e.getKey().equalsIgnoreCase("Set-Cookie")) continue;
-            for (String v : e.getValue()) {
-                String pair = v.contains(";") ? v.substring(0, v.indexOf(';')) : v;
-                if (ck.length() > 0) ck.append("; ");
-                ck.append(pair);
-            }
-        }
-        r.cookies = ck.toString();
-
-        InputStream in = r.code >= 400 ? c.getErrorStream() : c.getInputStream();
-        if (in != null) {
-            BufferedReader br = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append('\n');
-            br.close();
-            r.body = sb.toString();
-        }
-        c.disconnect();
-        return r;
-    }
-
-    private static String http(String method, String u, String body, String[][] headers) throws Exception {
-        Resp r = request(method, u, body, headers);
-        if (r.code >= 400) throw new Exception("HTTP " + r.code);
-        return r.body;
-    }
-
-    private void enqueue(String videoUrl, String folder, String name) {
+    private void enqueue(String videoUrl, String folder, String name, String cookie, String referer) {
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
         DownloadManager.Request req = new DownloadManager.Request(Uri.parse(videoUrl));
-        req.addRequestHeader("User-Agent", UA);
+        if (cookie != null && !cookie.isEmpty()) {
+            req.addRequestHeader("User-Agent", Net.IG_UA);
+            req.addRequestHeader("Cookie", cookie);
+        } else {
+            req.addRequestHeader("User-Agent", Net.UA);
+        }
+        if (referer != null && !referer.isEmpty()) req.addRequestHeader("Referer", referer);
+        if (Build.VERSION.SDK_INT < 29) req.allowScanningByMediaScanner();
         req.setTitle(name);
         req.setDescription("TikTok DL");
         req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
@@ -1180,6 +670,427 @@ public class MainActivity extends Activity {
             btnDownload.setEnabled(!b);
             btnDownload.setAlpha(b ? 0.5f : 1f);
         }
+    }
+
+    // ---------- Biblioteca ----------
+
+    private static final class Folder {
+        String net, user;
+        List<File> videos = new ArrayList<File>();
+
+        String key() { return net + "/" + user; }
+        String title() { return user.isEmpty() ? net : user; }
+    }
+
+    /** Contenedor con proporción fija (alto = ancho × ratio). */
+    private static final class RatioFrame extends FrameLayout {
+        final float ratio;
+
+        RatioFrame(Context c, float ratio) {
+            super(c);
+            this.ratio = ratio;
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            int w = MeasureSpec.getSize(widthSpec);
+            super.onMeasure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec((int) (w * ratio), MeasureSpec.EXACTLY));
+        }
+    }
+
+    private static final ViewOutlineProvider OVAL = new ViewOutlineProvider() {
+        @Override
+        public void getOutline(View v, Outline o) {
+            o.setOval(0, 0, v.getWidth(), v.getHeight());
+        }
+    };
+
+    private static final Comparator<File> NEWEST = new Comparator<File>() {
+        public int compare(File a, File b) {
+            return Long.compare(b.lastModified(), a.lastModified());
+        }
+    };
+
+    private boolean canRead() {
+        return Build.VERSION.SDK_INT < 23
+            || checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static boolean isVideo(File f) {
+        String n = f.getName().toLowerCase();
+        return f.isFile() && f.length() > 0 && (n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".webm"));
+    }
+
+    /** Lee Descargas/<red>/<perfil>/ y arma la lista de carpetas, la más reciente primero. */
+    private List<Folder> scanLibrary() {
+        List<Folder> out = new ArrayList<Folder>();
+        File base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        for (String net : NETS) {
+            File[] children = new File(base, net).listFiles();
+            if (children == null) continue;
+            Folder loose = new Folder();
+            loose.net = net;
+            loose.user = "";
+            for (File c : children) {
+                if (c.isDirectory()) {
+                    Folder f = new Folder();
+                    f.net = net;
+                    f.user = c.getName();
+                    File[] vids = c.listFiles();
+                    for (int i = 0; vids != null && i < vids.length; i++) {
+                        if (isVideo(vids[i])) f.videos.add(vids[i]);
+                    }
+                    if (!f.videos.isEmpty()) out.add(f);
+                } else if (isVideo(c)) {
+                    loose.videos.add(c);
+                }
+            }
+            if (!loose.videos.isEmpty()) out.add(loose);
+        }
+        for (Folder f : out) Collections.sort(f.videos, NEWEST);
+        Collections.sort(out, new Comparator<Folder>() {
+            public int compare(Folder a, Folder b) {
+                return Long.compare(b.videos.get(0).lastModified(), a.videos.get(0).lastModified());
+            }
+        });
+        return out;
+    }
+
+    private View libraryPage() {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(20), dp(4), dp(20), 0);
+
+        if (!canRead()) {
+            col.setGravity(Gravity.CENTER);
+            TextView msg = text("Para mostrar tus videos descargados, permite el acceso a los archivos.", 15, cText, false);
+            msg.setGravity(Gravity.CENTER);
+            col.addView(msg);
+            TextView allow = button("Permitir acceso", PINK, Color.WHITE);
+            allow.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    if (Build.VERSION.SDK_INT >= 23) {
+                        requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQ_READ);
+                    }
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+            lp.topMargin = dp(16);
+            col.addView(allow, lp);
+            return col;
+        }
+
+        final List<Folder> folders = scanLibrary();
+        Folder open = null;
+        for (Folder f : folders) if (f.key().equals(libKey)) open = f;
+        if (open == null) libKey = null;
+
+        GridView grid = new GridView(this);
+        grid.setVerticalScrollBarEnabled(false);
+        grid.setSelector(new GradientDrawable());
+        grid.setClipToPadding(false);
+        grid.setPadding(0, dp(14), 0, dp(12));
+        grid.setHorizontalSpacing(dp(10));
+        grid.setVerticalSpacing(dp(10));
+
+        if (open == null) {
+            int total = 0;
+            for (Folder f : folders) total += f.videos.size();
+            col.addView(text("Biblioteca", 18, cText, true));
+            col.addView(text(folders.size() + (folders.size() == 1 ? " carpeta · " : " carpetas · ")
+                + total + (total == 1 ? " video" : " videos"), 13, cSub, false));
+            if (folders.isEmpty()) {
+                TextView empty = text("Aún no hay descargas.\nLos videos que bajes aparecerán aquí, "
+                    + "agrupados por perfil.", 14, cSub, false);
+                empty.setGravity(Gravity.CENTER);
+                col.addView(empty, new LinearLayout.LayoutParams(-1, 0, 1));
+                return col;
+            }
+            grid.setNumColumns(2);
+            grid.setAdapter(new FolderAdapter(folders));
+            grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
+                public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
+                    libKey = folders.get(pos).key();
+                    buildUi();
+                }
+            });
+        } else {
+            final Folder f = open;
+            LinearLayout bar = new LinearLayout(this);
+            bar.setGravity(Gravity.CENTER_VERTICAL);
+            TextView back = text("‹", 26, cText, true);
+            back.setGravity(Gravity.CENTER);
+            back.setPadding(0, 0, 0, dp(4));
+            back.setBackground(ripple(rounded(cCard, 20), 0x33FFFFFF));
+            back.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) { onBackPressed(); }
+            });
+            bar.addView(back, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+            File av = avatarFile(f.net, f.user);
+            if (av.exists()) {
+                ImageView pic = circleImage();
+                loadImage(pic, av, false);
+                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(dp(40), dp(40));
+                plp.leftMargin = dp(10);
+                bar.addView(pic, plp);
+            }
+
+            LinearLayout tx = new LinearLayout(this);
+            tx.setOrientation(LinearLayout.VERTICAL);
+            TextView name = text(f.title(), 17, cText, true);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            tx.addView(name);
+            tx.addView(text(f.net + " · " + f.videos.size() + (f.videos.size() == 1 ? " video" : " videos"),
+                12, cSub, false));
+            LinearLayout.LayoutParams xlp = new LinearLayout.LayoutParams(0, -2, 1);
+            xlp.leftMargin = dp(10);
+            bar.addView(tx, xlp);
+            col.addView(bar);
+
+            grid.setNumColumns(3);
+            grid.setAdapter(new VideoAdapter(f.videos));
+            grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
+                public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
+                    play(f.videos.get(pos));
+                }
+            });
+        }
+        col.addView(grid, new LinearLayout.LayoutParams(-1, 0, 1));
+        return col;
+    }
+
+    private ImageView circleImage() {
+        ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackground(rounded(cField, 40));
+        iv.setOutlineProvider(OVAL);
+        iv.setClipToOutline(true);
+        return iv;
+    }
+
+    /** Tarjeta de carpeta: fondo con el último video y foto de perfil junto al nombre. */
+    private final class FolderAdapter extends BaseAdapter {
+        final List<Folder> data;
+
+        FolderAdapter(List<Folder> data) { this.data = data; }
+
+        public int getCount() { return data.size(); }
+        public Object getItem(int i) { return data.get(i); }
+        public long getItemId(int i) { return i; }
+
+        public View getView(int pos, View cv, ViewGroup parent) {
+            Object[] h;
+            if (cv == null) {
+                RatioFrame card = new RatioFrame(MainActivity.this, 1.2f);
+                card.setBackground(rounded(cField, 18));
+                card.setClipToOutline(true);
+
+                ImageView cover = new ImageView(MainActivity.this);
+                cover.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                card.addView(cover, new FrameLayout.LayoutParams(-1, -1));
+
+                View scrim = new View(MainActivity.this);
+                scrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                    new int[]{0x00000000, 0xE6000000}));
+                card.addView(scrim, new FrameLayout.LayoutParams(-1, dp(90), Gravity.BOTTOM));
+
+                LinearLayout row = new LinearLayout(MainActivity.this);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(10), dp(10), dp(10), dp(10));
+                ImageView avatar = circleImage();
+                row.addView(avatar, new LinearLayout.LayoutParams(dp(34), dp(34)));
+
+                LinearLayout tx = new LinearLayout(MainActivity.this);
+                tx.setOrientation(LinearLayout.VERTICAL);
+                TextView name = text("", 13, Color.WHITE, true);
+                name.setSingleLine(true);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                TextView sub = text("", 11, 0xCCFFFFFF, false);
+                sub.setSingleLine(true);
+                tx.addView(name);
+                tx.addView(sub);
+                LinearLayout.LayoutParams xlp = new LinearLayout.LayoutParams(0, -2, 1);
+                xlp.leftMargin = dp(8);
+                row.addView(tx, xlp);
+                card.addView(row, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+
+                h = new Object[]{cover, avatar, name, sub, tx};
+                card.setTag(h);
+                cv = card;
+            } else {
+                h = (Object[]) cv.getTag();
+            }
+            Folder f = data.get(pos);
+            loadImage((ImageView) h[0], f.videos.get(0), true);
+            ImageView avatar = (ImageView) h[1];
+            File av = avatarFile(f.net, f.user);
+            if (av.exists()) {
+                avatar.setVisibility(View.VISIBLE);
+                loadImage(avatar, av, false);
+            } else {
+                avatar.setVisibility(View.GONE);
+            }
+            ((LinearLayout.LayoutParams) ((View) h[4]).getLayoutParams()).leftMargin = av.exists() ? dp(8) : 0;
+            ((TextView) h[2]).setText(f.title());
+            ((TextView) h[3]).setText(f.net + " · " + f.videos.size());
+            return cv;
+        }
+    }
+
+    private final class VideoAdapter extends BaseAdapter {
+        final List<File> data;
+
+        VideoAdapter(List<File> data) { this.data = data; }
+
+        public int getCount() { return data.size(); }
+        public Object getItem(int i) { return data.get(i); }
+        public long getItemId(int i) { return i; }
+
+        public View getView(int pos, View cv, ViewGroup parent) {
+            ImageView thumb;
+            if (cv == null) {
+                RatioFrame card = new RatioFrame(MainActivity.this, 1.5f);
+                card.setBackground(rounded(cField, 12));
+                card.setClipToOutline(true);
+                thumb = new ImageView(MainActivity.this);
+                thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                card.addView(thumb, new FrameLayout.LayoutParams(-1, -1));
+                TextView playIcon = text("▶", 13, Color.WHITE, false);
+                playIcon.setShadowLayer(6, 0, 0, Color.BLACK);
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START);
+                lp.setMargins(dp(8), 0, 0, dp(6));
+                card.addView(playIcon, lp);
+                card.setTag(thumb);
+                cv = card;
+            } else {
+                thumb = (ImageView) cv.getTag();
+            }
+            loadImage(thumb, data.get(pos), true);
+            return cv;
+        }
+    }
+
+    // ---------- Miniaturas ----------
+
+    private final ExecutorService imgPool = Executors.newFixedThreadPool(2);
+    private final LruCache<String, Bitmap> imgCache = new LruCache<String, Bitmap>(24 * 1024 * 1024) {
+        @Override
+        protected int sizeOf(String key, Bitmap b) {
+            return b.getByteCount();
+        }
+    };
+
+    /** Carga una imagen o la miniatura de un video sin bloquear la interfaz. */
+    private void loadImage(final ImageView iv, final File f, final boolean video) {
+        final String key = (video ? "v:" : "i:") + f.getPath() + ":" + f.lastModified();
+        iv.setTag(key);
+        Bitmap cached = imgCache.get(key);
+        if (cached != null) {
+            iv.setImageBitmap(cached);
+            return;
+        }
+        iv.setImageDrawable(null);
+        imgPool.execute(new Runnable() {
+            public void run() {
+                final Bitmap b = video ? videoThumb(f, key) : decodeSmall(f, 256);
+                if (b == null) return;
+                imgCache.put(key, b);
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        if (key.equals(iv.getTag())) iv.setImageBitmap(b);
+                    }
+                });
+            }
+        });
+    }
+
+    private Bitmap videoThumb(File f, String key) {
+        File cache = new File(getCacheDir(), "thumbs/" + Integer.toHexString(key.hashCode()) + ".jpg");
+        if (cache.exists()) {
+            Bitmap b = BitmapFactory.decodeFile(cache.getPath());
+            if (b != null) return b;
+        }
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(f.getPath());
+            Bitmap full = r.getFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if (full == null) return null;
+            int w = full.getWidth(), h = full.getHeight();
+            float s = Math.min(1f, 360f / Math.min(w, h));
+            Bitmap small = s < 1f
+                ? Bitmap.createScaledBitmap(full, Math.round(w * s), Math.round(h * s), true) : full;
+            cache.getParentFile().mkdirs();
+            FileOutputStream os = new FileOutputStream(cache);
+            small.compress(Bitmap.CompressFormat.JPEG, 82, os);
+            os.close();
+            return small;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            try {
+                r.release();
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private static Bitmap decodeSmall(File f, int target) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(f.getPath(), o);
+        int s = 1;
+        while (o.outWidth / (s * 2) >= target && o.outHeight / (s * 2) >= target) s *= 2;
+        BitmapFactory.Options o2 = new BitmapFactory.Options();
+        o2.inSampleSize = s;
+        return BitmapFactory.decodeFile(f.getPath(), o2);
+    }
+
+    // ---------- Reproductor ----------
+
+    private void play(File f) {
+        final Dialog d = new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        FrameLayout box = new FrameLayout(this);
+        box.setBackgroundColor(Color.BLACK);
+
+        final VideoView vv = new VideoView(this);
+        box.addView(vv, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+
+        TextView close = text("✕", 18, Color.WHITE, true);
+        close.setGravity(Gravity.CENTER);
+        close.setBackground(rounded(0x80000000, 22));
+        close.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { d.dismiss(); }
+        });
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP | Gravity.END);
+        clp.setMargins(0, dp(14), dp(14), 0);
+        box.addView(close, clp);
+
+        MediaController mc = new MediaController(this);
+        mc.setAnchorView(vv);
+        vv.setMediaController(mc);
+        vv.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+            public void onPrepared(MediaPlayer mp) {
+                mp.setLooping(true);
+                vv.start();
+            }
+        });
+        vv.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+            public boolean onError(MediaPlayer mp, int what, int extra) {
+                toast("No se pudo reproducir (¿todavía se está descargando?)");
+                d.dismiss();
+                return true;
+            }
+        });
+        d.setContentView(box);
+        d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+            public void onDismiss(android.content.DialogInterface di) {
+                vv.stopPlayback();
+            }
+        });
+        d.show();
+        vv.setVideoPath(f.getAbsolutePath());
     }
 
     // ---------- Helpers de UI ----------
