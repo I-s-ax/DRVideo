@@ -210,7 +210,7 @@ public class MainActivity extends Activity {
         card.addView(status);
         setBusy(busy);
 
-        TextView foot = text("Se guardan en Descargas, en la carpeta de cada red", 12, cSub, false);
+        TextView foot = text("Se guardan en Descargas / red / perfil", 12, cSub, false);
         foot.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(-1, -2);
         flp.topMargin = dp(20);
@@ -500,10 +500,16 @@ public class MainActivity extends Activity {
                     List<String[]> items = kind == 0 ? fetchTikTok(url)
                         : kind == 1 ? fetchInstagram(url, igCookies, igUa)
                         : kind == 2 ? fetchX(url) : fetchFacebook(url);
-                    for (String[] it : items) enqueue(it[0], names[kind], it[1]);
-                    done(items.size() == 1
-                        ? "✓ Descargando " + items.get(0)[1] + "\nMira las notificaciones."
-                        : "✓ Descargando " + items.size() + " videos\nMira las notificaciones.");
+                    String folder = names[kind];
+                    for (String[] it : items) {
+                        String user = it.length > 2 ? cleanName(it[2]) : "";
+                        String file = user.isEmpty() ? it[1]
+                            : user + "_" + it[1].replaceFirst("^(tiktok|ig|x|fb)_", "");
+                        folder = names[kind] + (user.isEmpty() ? "" : "/" + user);
+                        enqueue(it[0], folder, file);
+                    }
+                    done("✓ Descargando " + (items.size() == 1 ? "video" : items.size() + " videos")
+                        + "\nCarpeta: Descargas/" + folder);
                 } catch (Exception e) {
                     done("Error: " + e.getMessage());
                 }
@@ -523,16 +529,18 @@ public class MainActivity extends Activity {
         Matcher m = X_ID.matcher(url);
         if (!m.find()) throw new Exception("No reconocí el enlace. Usa el de un post de X (…/status/123…).");
         String id = m.group(1);
+        String[] who = {firstGroup(X_USER_URL, url)};
+        if ("i".equals(who[0])) who[0] = "";
 
         String[] names = {"x", "fx", "vx"};
         StringBuilder log = new StringBuilder();
         for (int i = 0; i < names.length; i++) {
             try {
-                List<String> urls = i == 0 ? xSyndication(id) : i == 1 ? xFx(id) : xVx(id);
+                List<String> urls = i == 0 ? xSyndication(id, who) : i == 1 ? xFx(id, who) : xVx(id, who);
                 if (!urls.isEmpty()) {
                     List<String[]> out = new ArrayList<String[]>();
                     for (int k = 0; k < urls.size(); k++) {
-                        out.add(new String[]{urls.get(k), "x_" + id + (urls.size() > 1 ? "_" + (k + 1) : "") + ".mp4"});
+                        out.add(new String[]{urls.get(k), "x_" + id + (urls.size() > 1 ? "_" + (k + 1) : "") + ".mp4", who[0]});
                     }
                     return out;
                 }
@@ -546,7 +554,7 @@ public class MainActivity extends Activity {
     }
 
     /** API pública de X para posts incrustados. */
-    private static List<String> xSyndication(String id) throws Exception {
+    private static List<String> xSyndication(String id, String[] who) throws Exception {
         String abc = "123456789abcdefghijklmnopqrstuvwxyz";
         StringBuilder tok = new StringBuilder();
         java.util.Random rnd = new java.util.Random();
@@ -556,6 +564,8 @@ public class MainActivity extends Activity {
         if (r.code >= 400) throw new Exception("HTTP " + r.code);
         JSONObject j = new JSONObject(r.body);
         if ("TweetTombstone".equals(j.optString("__typename", ""))) throw new Exception("restringido");
+        JSONObject xu = j.optJSONObject("user");
+        if (xu != null && !xu.optString("screen_name", "").isEmpty()) who[0] = xu.optString("screen_name", "");
         List<String> out = new ArrayList<String>();
         org.json.JSONArray md = j.optJSONArray("mediaDetails");
         for (int i = 0; md != null && i < md.length(); i++) {
@@ -577,13 +587,15 @@ public class MainActivity extends Activity {
         return out;
     }
 
-    private static List<String> xFx(String id) throws Exception {
+    private static List<String> xFx(String id, String[] who) throws Exception {
         Resp r = request("GET", "https://api.fxtwitter.com/status/" + id, null,
             new String[][]{{"User-Agent", "TikTokDL/2.3"}});
         if (r.code >= 400) throw new Exception("HTTP " + r.code);
         List<String> out = new ArrayList<String>();
         JSONObject tweet = new JSONObject(r.body).optJSONObject("tweet");
         JSONObject media = tweet == null ? null : tweet.optJSONObject("media");
+        JSONObject fa = tweet == null ? null : tweet.optJSONObject("author");
+        if (fa != null && !fa.optString("screen_name", "").isEmpty()) who[0] = fa.optString("screen_name", "");
         org.json.JSONArray vids = media == null ? null : media.optJSONArray("videos");
         for (int i = 0; vids != null && i < vids.length(); i++) {
             String v = vids.getJSONObject(i).optString("url", "");
@@ -592,12 +604,14 @@ public class MainActivity extends Activity {
         return out;
     }
 
-    private static List<String> xVx(String id) throws Exception {
+    private static List<String> xVx(String id, String[] who) throws Exception {
         Resp r = request("GET", "https://api.vxtwitter.com/Twitter/status/" + id, null,
             new String[][]{{"User-Agent", "TikTokDL/2.3"}});
         if (r.code >= 400) throw new Exception("HTTP " + r.code);
         List<String> out = new ArrayList<String>();
-        org.json.JSONArray me = new JSONObject(r.body).optJSONArray("media_extended");
+        JSONObject vj = new JSONObject(r.body);
+        if (!vj.optString("user_screen_name", "").isEmpty()) who[0] = vj.optString("user_screen_name", "");
+        org.json.JSONArray me = vj.optJSONArray("media_extended");
         for (int i = 0; me != null && i < me.length(); i++) {
             JSONObject o = me.getJSONObject(i);
             String type = o.optString("type", "");
@@ -623,7 +637,8 @@ public class MainActivity extends Activity {
 
         List<String[]> out = new ArrayList<String[]>();
         out.add(new String[]{video, "tiktok_" + d.optString("id", String.valueOf(System.currentTimeMillis())) + ".mp4"});
-        return out;
+        JSONObject author = d.optJSONObject("author");
+        return withUser(out, author == null ? "" : author.optString("unique_id", ""));
     }
 
     // ---------- Instagram ----------
@@ -760,7 +775,8 @@ public class MainActivity extends Activity {
             if (v != null) out.add(new String[]{v, "ig_" + label + ".mp4"});
         }
         if (out.isEmpty()) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
-        return out;
+        JSONObject owner = it.optJSONObject("user");
+        return withUser(out, owner == null ? "" : owner.optString("username", ""));
     }
 
     private static String igBestVersion(JSONObject media) throws Exception {
@@ -863,7 +879,8 @@ public class MainActivity extends Activity {
             if (!v.isEmpty()) out.add(new String[]{v, "ig_" + code + ".mp4"});
         }
         if (!flagged) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
-        return out;
+        JSONObject owner = media.optJSONObject("owner");
+        return withUser(out, owner == null ? "" : owner.optString("username", ""));
     }
 
     /** Método 3: página embed. */
@@ -904,7 +921,7 @@ public class MainActivity extends Activity {
             }
             if (!out.isEmpty()) break;
         }
-        return out;
+        return withUser(out, firstGroup(IG_USER_HTML, html));
     }
 
     /** Quita los escapes JSON (\/ y \u0026), aunque vengan escapados varias veces. */
@@ -981,6 +998,7 @@ public class MainActivity extends Activity {
         url = url.replaceFirst("//(?:m|mbasic|web|touch)\\.facebook\\.com", "//www.facebook.com");
         StringBuilder log = new StringBuilder();
         String video = null;
+        String owner = "";
         String page = url;
 
         // 1) Página del video (también resuelve fb.watch y /share/)
@@ -990,6 +1008,7 @@ public class MainActivity extends Activity {
             if (r.code >= 400) log.append("web=HTTP ").append(r.code).append("; ");
             else {
                 video = fbScrape(r.body);
+                owner = fbOwner(r.body, r.finalUrl);
                 if (video == null) {
                     log.append(r.finalUrl.contains("/login") || r.body.contains("login_form")
                         ? "web=pide login; " : "web=sin video; ");
@@ -1008,6 +1027,7 @@ public class MainActivity extends Activity {
                 if (r.code >= 400) log.append("embed=HTTP ").append(r.code).append("; ");
                 else {
                     video = fbScrape(r.body);
+                    if (owner.isEmpty()) owner = fbOwner(r.body, page);
                     if (video == null) log.append("embed=sin video; ");
                 }
             } catch (Exception e) {
@@ -1022,8 +1042,56 @@ public class MainActivity extends Activity {
         Matcher m = FB_VID.matcher(page);
         String id = m.find() ? m.group(1) : String.valueOf(System.currentTimeMillis());
         List<String[]> out = new ArrayList<String[]>();
-        out.add(new String[]{video, "fb_" + id + ".mp4"});
+        out.add(new String[]{video, "fb_" + id + ".mp4", owner});
         return out;
+    }
+
+    // ---------- Nombre del perfil ----------
+
+    /** Agrega el usuario como tercer dato de cada video. */
+    private static List<String[]> withUser(List<String[]> items, String user) {
+        List<String[]> out = new ArrayList<String[]>();
+        for (String[] it : items) out.add(new String[]{it[0], it[1], user == null ? "" : user});
+        return out;
+    }
+
+    /** Deja el nombre apto para carpeta/archivo. */
+    private static String cleanName(String s) {
+        if (s == null) return "";
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length() && b.length() < 40; i++) {
+            char c = s.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '.' || c == '-' || c == '_') b.append(c);
+            else if (c == ' ' && b.length() > 0 && b.charAt(b.length() - 1) != '_') b.append('_');
+        }
+        String r = b.toString();
+        while (r.startsWith(".") || r.startsWith("_")) r = r.substring(1);
+        while (r.endsWith(".") || r.endsWith("_")) r = r.substring(0, r.length() - 1);
+        return r;
+    }
+
+    private static String firstGroup(Pattern p, String s) {
+        Matcher m = p.matcher(s);
+        return m.find() ? m.group(1) : "";
+    }
+
+    private static final Pattern IG_USER_HTML = Pattern.compile("\\\\*\"username\\\\*\"\\s*:\\s*\\\\*\"([A-Za-z0-9._]+)\\\\*\"");
+    private static final Pattern X_USER_URL = Pattern.compile("(?:twitter\\.com|[/.]x\\.com)/([A-Za-z0-9_]+)/status");
+    private static final Pattern FB_USER_URL = Pattern.compile("facebook\\.com/([^/?#]+)/(?:videos|posts)/");
+    private static final Pattern[] FB_OWNER = {
+        Pattern.compile("\"owner\":\\{\"__typename\":\"(?:User|Page)\",[^{}]*?\"name\":\"([^\"]+)\""),
+        Pattern.compile("\"video_owner\":\\{[^{}]*?\"name\":\"([^\"]+)\""),
+        Pattern.compile("\"owning_profile\":\\{[^{}]*?\"name\":\"([^\"]+)\""),
+        Pattern.compile("\"actors\":\\[\\{[^{}]*?\"name\":\"([^\"]+)\""),
+    };
+
+    private static String fbOwner(String html, String pageUrl) {
+        for (Pattern p : FB_OWNER) {
+            String n = firstGroup(p, html);
+            if (!n.isEmpty()) return unescape(n);
+        }
+        String u = firstGroup(FB_USER_URL, pageUrl);
+        return "watch".equals(u) || "reel".equals(u) ? "" : u;
     }
 
     // ---------- Red ----------
