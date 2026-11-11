@@ -2,6 +2,7 @@ package com.isa.tiktokdl;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -26,6 +27,10 @@ import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.CookieManager;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -143,7 +148,7 @@ public class MainActivity extends Activity {
         header.addView(gear, new LinearLayout.LayoutParams(dp(44), dp(44)));
         col.addView(header);
 
-        TextView sub = text("TikTok e Instagram, sin marca de agua", 14, cSub, false);
+        TextView sub = text("TikTok, Instagram y X en un toque", 14, cSub, false);
         sub.setPadding(0, dp(6), 0, 0);
         col.addView(sub);
 
@@ -159,7 +164,7 @@ public class MainActivity extends Activity {
         card.addView(text("Enlace del video", 13, cSub, true));
 
         input = new EditText(this);
-        input.setHint("Enlace de TikTok o Instagram");
+        input.setHint("Enlace de TikTok, Instagram o X");
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         input.setTextColor(cText);
@@ -200,12 +205,12 @@ public class MainActivity extends Activity {
         card.addView(progress, plp);
 
         status = text(keepStatus != null ? keepStatus.toString()
-            : "Tip: en TikTok o Instagram toca Compartir → TikTok DL", 14, cSub, false);
+            : "Tip: en la app del video toca Compartir → TikTok DL", 14, cSub, false);
         status.setPadding(0, dp(10), 0, 0);
         card.addView(status);
         setBusy(busy);
 
-        TextView foot = text("Se guardan en Descargas/TikTok y Descargas/Instagram", 12, cSub, false);
+        TextView foot = text("Se guardan en Descargas, en la carpeta de cada red", 12, cSub, false);
         foot.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(-1, -2);
         flp.topMargin = dp(20);
@@ -291,6 +296,24 @@ public class MainActivity extends Activity {
         }
         v.addView(hscroll(icons));
 
+        // Cuenta de Instagram
+        v.addView(section("Cuenta de Instagram"));
+        final boolean logged = prefs.getString("igCookies", "").contains("sessionid=");
+        LinearLayout acc = new LinearLayout(this);
+        acc.addView(chip(logged ? "Cerrar sesión" : "Iniciar sesión", !logged, new Runnable() {
+            public void run() {
+                if (logged) igLogout(); else igLogin();
+            }
+        }));
+        v.addView(acc);
+        TextView note = text(logged
+            ? "Sesión activa: permite reels, historias y cuentas privadas que sigues."
+            : "Necesaria cuando Instagram pide login. La contraseña se escribe en la página oficial de Instagram; "
+              + "aquí solo se guarda la cookie de sesión en tu teléfono. Recomendado: usar una cuenta secundaria.",
+            12, cSub, false);
+        note.setPadding(0, dp(8), 0, 0);
+        v.addView(note);
+
         ScrollView sv = new ScrollView(this);
         sv.addView(v);
         settingsDialog = new AlertDialog.Builder(this, dark
@@ -367,6 +390,63 @@ public class MainActivity extends Activity {
         return BGS[0];
     }
 
+    // ---------- Sesión de Instagram ----------
+
+    private void igLogin() {
+        if (settingsDialog != null) settingsDialog.dismiss();
+        final Dialog d = new Dialog(this, android.R.style.Theme_Material_NoActionBar);
+        final WebView w = new WebView(this);
+        WebSettings ws = w.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        final String ua = ws.getUserAgentString().replace("; wv", "");
+        ws.setUserAgentString(ua);
+        final CookieManager cm = CookieManager.getInstance();
+        cm.setAcceptCookie(true);
+        cm.setAcceptThirdPartyCookies(w, true);
+        w.setWebViewClient(new WebViewClient() {
+            boolean saved;
+
+            void check() {
+                String c = cm.getCookie("https://www.instagram.com");
+                if (saved || c == null || !c.contains("sessionid=")) return;
+                saved = true;
+                prefs.edit().putString("igCookies", c).putString("igUa", ua).apply();
+                cm.flush();
+                d.dismiss();
+                toast("Sesión de Instagram guardada");
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                check();
+            }
+
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                check();
+            }
+        });
+        d.setContentView(w, new ViewGroup.LayoutParams(-1, -1));
+        d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+            public void onDismiss(android.content.DialogInterface di) {
+                w.stopLoading();
+                w.destroy();
+            }
+        });
+        d.show();
+        w.loadUrl("https://www.instagram.com/accounts/login/");
+    }
+
+    private void igLogout() {
+        prefs.edit().remove("igCookies").remove("igUa").apply();
+        CookieManager cm = CookieManager.getInstance();
+        cm.removeAllCookies(null);
+        cm.flush();
+        toast("Sesión cerrada");
+        refreshSettings();
+    }
+
     // ---------- Descarga ----------
 
     private void handleIntent(Intent i) {
@@ -399,21 +479,26 @@ public class MainActivity extends Activity {
     private void download() {
         if (busy) return;
         final String url = extractUrl(input.getText().toString());
-        final boolean isTikTok = url != null && url.contains("tiktok.com");
-        final boolean isInsta = url != null && (url.contains("instagram.com") || url.contains("instagr.am"));
-        if (!isTikTok && !isInsta) {
-            status.setText("Enlace no válido. Usa un enlace de TikTok o Instagram.");
+        final int kind = url == null ? -1
+            : url.contains("tiktok.com") ? 0
+            : (url.contains("instagram.com") || url.contains("instagr.am")) ? 1
+            : (X_ID.matcher(url).find() || url.contains("//t.co/")) ? 2 : -1;
+        if (kind < 0) {
+            status.setText("Enlace no válido. Usa un enlace de TikTok, Instagram o X.");
             return;
         }
+        final String[] names = {"TikTok", "Instagram", "X"};
+        final String igCookies = prefs.getString("igCookies", null);
+        final String igUa = prefs.getString("igUa", IG_UA);
         setBusy(true);
-        status.setText(isTikTok ? "Obteniendo video de TikTok…" : "Obteniendo video de Instagram…");
+        status.setText("Obteniendo video de " + names[kind] + "…");
 
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    List<String[]> items = isTikTok ? fetchTikTok(url) : fetchInstagram(url);
-                    String folder = isTikTok ? "TikTok" : "Instagram";
-                    for (String[] it : items) enqueue(it[0], folder, it[1]);
+                    List<String[]> items = kind == 0 ? fetchTikTok(url)
+                        : kind == 1 ? fetchInstagram(url, igCookies, igUa) : fetchX(url);
+                    for (String[] it : items) enqueue(it[0], names[kind], it[1]);
                     done(items.size() == 1
                         ? "✓ Descargando " + items.get(0)[1] + "\nMira las notificaciones."
                         : "✓ Descargando " + items.size() + " videos\nMira las notificaciones.");
@@ -422,6 +507,102 @@ public class MainActivity extends Activity {
                 }
             }
         }).start();
+    }
+
+    // ---------- X / Twitter ----------
+
+    private static final Pattern X_ID = Pattern.compile(
+        "(?:twitter\\.com|[/.]x\\.com)/(?:[^/?#]+/){1,2}status(?:es)?/(\\d+)");
+
+    private static List<String[]> fetchX(String url) throws Exception {
+        if (url.contains("//t.co/")) {
+            url = request("GET", url, null, new String[][]{{"User-Agent", "curl/8.0"}}).finalUrl;
+        }
+        Matcher m = X_ID.matcher(url);
+        if (!m.find()) throw new Exception("No reconocí el enlace. Usa el de un post de X (…/status/123…).");
+        String id = m.group(1);
+
+        String[] names = {"x", "fx", "vx"};
+        StringBuilder log = new StringBuilder();
+        for (int i = 0; i < names.length; i++) {
+            try {
+                List<String> urls = i == 0 ? xSyndication(id) : i == 1 ? xFx(id) : xVx(id);
+                if (!urls.isEmpty()) {
+                    List<String[]> out = new ArrayList<String[]>();
+                    for (int k = 0; k < urls.size(); k++) {
+                        out.add(new String[]{urls.get(k), "x_" + id + (urls.size() > 1 ? "_" + (k + 1) : "") + ".mp4"});
+                    }
+                    return out;
+                }
+                log.append(names[i]).append("=sin video; ");
+            } catch (Exception e) {
+                log.append(names[i]).append("=").append(e.getMessage()).append("; ");
+            }
+        }
+        throw new Exception("No encontré video en ese post. Puede ser solo texto o fotos, de una cuenta privada "
+            + "o con restricción de edad.\n[" + log.toString().trim() + "]");
+    }
+
+    /** API pública de X para posts incrustados. */
+    private static List<String> xSyndication(String id) throws Exception {
+        String abc = "123456789abcdefghijklmnopqrstuvwxyz";
+        StringBuilder tok = new StringBuilder();
+        java.util.Random rnd = new java.util.Random();
+        for (int i = 0; i < 10; i++) tok.append(abc.charAt(rnd.nextInt(abc.length())));
+        Resp r = request("GET", "https://cdn.syndication.twimg.com/tweet-result?id=" + id + "&token=" + tok,
+            null, new String[][]{{"User-Agent", IG_UA}});
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        JSONObject j = new JSONObject(r.body);
+        if ("TweetTombstone".equals(j.optString("__typename", ""))) throw new Exception("restringido");
+        List<String> out = new ArrayList<String>();
+        org.json.JSONArray md = j.optJSONArray("mediaDetails");
+        for (int i = 0; md != null && i < md.length(); i++) {
+            JSONObject vi = md.getJSONObject(i).optJSONObject("video_info");
+            org.json.JSONArray vars = vi == null ? null : vi.optJSONArray("variants");
+            String best = null;
+            int bestRate = -1;
+            for (int k = 0; vars != null && k < vars.length(); k++) {
+                JSONObject v = vars.getJSONObject(k);
+                if (!"video/mp4".equals(v.optString("content_type", ""))) continue;
+                int rate = v.optInt("bitrate", 0);
+                if (rate > bestRate) {
+                    bestRate = rate;
+                    best = v.optString("url", "");
+                }
+            }
+            if (best != null && !best.isEmpty()) out.add(best);
+        }
+        return out;
+    }
+
+    private static List<String> xFx(String id) throws Exception {
+        Resp r = request("GET", "https://api.fxtwitter.com/status/" + id, null,
+            new String[][]{{"User-Agent", "TikTokDL/2.3"}});
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        List<String> out = new ArrayList<String>();
+        JSONObject tweet = new JSONObject(r.body).optJSONObject("tweet");
+        JSONObject media = tweet == null ? null : tweet.optJSONObject("media");
+        org.json.JSONArray vids = media == null ? null : media.optJSONArray("videos");
+        for (int i = 0; vids != null && i < vids.length(); i++) {
+            String v = vids.getJSONObject(i).optString("url", "");
+            if (v.startsWith("http")) out.add(v);
+        }
+        return out;
+    }
+
+    private static List<String> xVx(String id) throws Exception {
+        Resp r = request("GET", "https://api.vxtwitter.com/Twitter/status/" + id, null,
+            new String[][]{{"User-Agent", "TikTokDL/2.3"}});
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+        List<String> out = new ArrayList<String>();
+        org.json.JSONArray me = new JSONObject(r.body).optJSONArray("media_extended");
+        for (int i = 0; me != null && i < me.length(); i++) {
+            JSONObject o = me.getJSONObject(i);
+            String type = o.optString("type", "");
+            String v = o.optString("url", "");
+            if (("video".equals(type) || "gif".equals(type)) && v.startsWith("http")) out.add(v);
+        }
+        return out;
     }
 
     // ---------- TikTok ----------
@@ -463,12 +644,26 @@ public class MainActivity extends Activity {
         return m.find() ? m.group(1) : null;
     }
 
-    private static List<String[]> fetchInstagram(String url) throws Exception {
-        if (url.contains("/stories/")) throw new Exception("Las historias requieren iniciar sesión; no son compatibles.");
+    private static final Pattern IG_STORY = Pattern.compile("instagram\\.com/stories/[^/?#]+/(\\d+)");
+
+    private static List<String[]> fetchInstagram(String url, String cookies, String ua) throws Exception {
+        boolean logged = cookies != null && cookies.contains("sessionid=");
+
+        Matcher st = IG_STORY.matcher(url);
+        if (st.find()) {
+            if (!logged) throw new Exception("Las historias requieren sesión. Ve a ⚙ → Iniciar sesión en Instagram.");
+            try {
+                return igAuth(st.group(1), "story_" + st.group(1), cookies, ua);
+            } catch (NoVideo e) {
+                throw new Exception("Esa historia es una foto, no un video.");
+            }
+        }
+        if (url.contains("/stories/")) throw new Exception("Abre la historia y copia el enlace de esa historia en concreto.");
 
         // Los enlaces instagram.com/share/... son cortos: hay que seguir la redirección
         if (url.contains("/share/")) {
-            Resp r = request("GET", url, null, new String[][]{{"User-Agent", IG_UA}});
+            Resp r = request("GET", url, null, new String[][]{
+                {"User-Agent", logged ? ua : IG_UA}, {"Cookie", logged ? cookies : ""}});
             if (r.finalUrl.contains("/share/") || igShortcode(r.finalUrl) == null) {
                 throw new Exception("No pude abrir ese enlace corto. En Instagram usa ⋯ → Copiar enlace y pégalo aquí.");
             }
@@ -478,8 +673,20 @@ public class MainActivity extends Activity {
         String code = igShortcode(url);
         if (code == null) throw new Exception("No reconocí el enlace. Usa uno de un reel o publicación.");
 
-        String[] names = {"api", "api2", "embed", "web"};
         StringBuilder log = new StringBuilder();
+        if (logged) {
+            try {
+                List<String[]> out = igAuth(igPk(code), code, cookies, ua);
+                if (!out.isEmpty()) return out;
+                log.append("sesion=sin video; ");
+            } catch (NoVideo e) {
+                throw e;
+            } catch (Exception e) {
+                log.append("sesion=").append(e.getMessage()).append("; ");
+            }
+        }
+
+        String[] names = {"api", "api2", "embed", "web"};
         for (int i = 0; i < names.length; i++) {
             try {
                 List<String[]> out;
@@ -495,8 +702,79 @@ public class MainActivity extends Activity {
                 log.append(names[i]).append("=").append(e.getMessage()).append("; ");
             }
         }
-        throw new Exception("Instagram no entregó el video. Puede ser una cuenta privada o un bloqueo temporal "
-            + "(prueba con datos móviles o en unos minutos).\n[" + log.toString().trim() + "]");
+        throw new Exception((logged
+            ? "Instagram no entregó el video ni con tu sesión. Si dice que caducó, cierra sesión y vuelve a entrar en ⚙."
+            : "Instagram pide iniciar sesión para este video. Ve a ⚙ → Iniciar sesión en Instagram.")
+            + "\n[" + log.toString().trim() + "]");
+    }
+
+    /** Con sesión iniciada: API de medios, igual que la web de Instagram. */
+    private static List<String[]> igAuth(String pk, String label, String cookies, String ua) throws Exception {
+        String csrf = cookieValue(cookies, "csrftoken");
+        String[][] h = {
+            {"User-Agent", ua},
+            {"Accept", "*/*"},
+            {"X-IG-App-ID", IG_APP_ID},
+            {"X-ASBD-ID", "198387"},
+            {"X-IG-WWW-Claim", "0"},
+            {"X-Requested-With", "XMLHttpRequest"},
+            {"X-CSRFToken", csrf == null ? "" : csrf},
+            {"Origin", "https://www.instagram.com"},
+            {"Referer", "https://www.instagram.com/"},
+            {"Cookie", cookies},
+        };
+        Resp r = request("GET", "https://i.instagram.com/api/v1/media/" + pk + "/info/", null, h);
+        if (r.code >= 400) {
+            Resp r2 = request("GET", "https://www.instagram.com/api/v1/media/" + pk + "/info/", null, h);
+            if (r2.code < 400) r = r2;
+        }
+        if (r.code == 401 || r.code == 403 || r.body.contains("login_required")) {
+            throw new Exception("sesión caducada (HTTP " + r.code + ")");
+        }
+        if (r.code >= 400) throw new Exception("HTTP " + r.code);
+
+        org.json.JSONArray items;
+        try {
+            items = new JSONObject(r.body).optJSONArray("items");
+        } catch (Exception e) {
+            throw new Exception("respuesta no JSON");
+        }
+        if (items == null || items.length() == 0) throw new Exception("sin datos");
+        JSONObject it = items.getJSONObject(0);
+
+        List<String[]> out = new ArrayList<String[]>();
+        org.json.JSONArray car = it.optJSONArray("carousel_media");
+        if (car != null) {
+            int n = 0;
+            for (int i = 0; i < car.length(); i++) {
+                String v = igBestVersion(car.getJSONObject(i));
+                if (v != null) {
+                    n++;
+                    out.add(new String[]{v, "ig_" + label + "_" + n + ".mp4"});
+                }
+            }
+        } else {
+            String v = igBestVersion(it);
+            if (v != null) out.add(new String[]{v, "ig_" + label + ".mp4"});
+        }
+        if (out.isEmpty()) throw new NoVideo("Esa publicación no tiene video (solo fotos).");
+        return out;
+    }
+
+    private static String igBestVersion(JSONObject media) throws Exception {
+        org.json.JSONArray vv = media.optJSONArray("video_versions");
+        String best = null;
+        int bestW = -1;
+        for (int i = 0; vv != null && i < vv.length(); i++) {
+            JSONObject v = vv.getJSONObject(i);
+            String u = v.optString("url", "");
+            int w = v.optInt("width", 0);
+            if (!u.isEmpty() && w > bestW) {
+                bestW = w;
+                best = u;
+            }
+        }
+        return best;
     }
 
     private static String[][] igHeaders(String code, String csrf, String cookies) {
