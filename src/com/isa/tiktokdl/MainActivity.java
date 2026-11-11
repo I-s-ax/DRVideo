@@ -148,7 +148,7 @@ public class MainActivity extends Activity {
         header.addView(gear, new LinearLayout.LayoutParams(dp(44), dp(44)));
         col.addView(header);
 
-        TextView sub = text("TikTok, Instagram y X en un toque", 14, cSub, false);
+        TextView sub = text("TikTok, Instagram, X y Facebook", 14, cSub, false);
         sub.setPadding(0, dp(6), 0, 0);
         col.addView(sub);
 
@@ -164,7 +164,7 @@ public class MainActivity extends Activity {
         card.addView(text("Enlace del video", 13, cSub, true));
 
         input = new EditText(this);
-        input.setHint("Enlace de TikTok, Instagram o X");
+        input.setHint("Pega el enlace del video");
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         input.setTextColor(cText);
@@ -482,12 +482,13 @@ public class MainActivity extends Activity {
         final int kind = url == null ? -1
             : url.contains("tiktok.com") ? 0
             : (url.contains("instagram.com") || url.contains("instagr.am")) ? 1
-            : (X_ID.matcher(url).find() || url.contains("//t.co/")) ? 2 : -1;
+            : (X_ID.matcher(url).find() || url.contains("//t.co/")) ? 2
+            : (url.contains("facebook.com") || url.contains("fb.watch") || url.contains("//fb.com/")) ? 3 : -1;
         if (kind < 0) {
-            status.setText("Enlace no válido. Usa un enlace de TikTok, Instagram o X.");
+            status.setText("Enlace no válido. Usa un enlace de TikTok, Instagram, X o Facebook.");
             return;
         }
-        final String[] names = {"TikTok", "Instagram", "X"};
+        final String[] names = {"TikTok", "Instagram", "X", "Facebook"};
         final String igCookies = prefs.getString("igCookies", null);
         final String igUa = prefs.getString("igUa", IG_UA);
         setBusy(true);
@@ -497,7 +498,8 @@ public class MainActivity extends Activity {
             public void run() {
                 try {
                     List<String[]> items = kind == 0 ? fetchTikTok(url)
-                        : kind == 1 ? fetchInstagram(url, igCookies, igUa) : fetchX(url);
+                        : kind == 1 ? fetchInstagram(url, igCookies, igUa)
+                        : kind == 2 ? fetchX(url) : fetchFacebook(url);
                     for (String[] it : items) enqueue(it[0], names[kind], it[1]);
                     done(items.size() == 1
                         ? "✓ Descargando " + items.get(0)[1] + "\nMira las notificaciones."
@@ -936,6 +938,92 @@ public class MainActivity extends Activity {
             if (part.startsWith(name + "=")) return part.substring(name.length() + 1);
         }
         return null;
+    }
+
+    // ---------- Facebook ----------
+
+    private static final String[][] FB_HEADERS = {
+        {"User-Agent", IG_UA},
+        {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        {"Accept-Language", "en-US,en;q=0.9"},
+        {"Sec-Fetch-Dest", "document"},
+        {"Sec-Fetch-Mode", "navigate"},
+        {"Sec-Fetch-Site", "none"},
+        {"Sec-Fetch-User", "?1"},
+        {"Upgrade-Insecure-Requests", "1"},
+    };
+    // De mejor a peor calidad
+    private static final Pattern[] FB_HTML = {
+        Pattern.compile("\"progressive_url\":\"([^\"]+)\",\"failure_reason\":[^,]*,\"metadata\":\\{\"quality\":\"HD\"\\}"),
+        Pattern.compile("\"browser_native_hd_url\":\"([^\"]+)\""),
+        Pattern.compile("\"playable_url_quality_hd\":\"([^\"]+)\""),
+        Pattern.compile("\"?hd_src\"?:\"([^\"]+)\""),
+        Pattern.compile("\"progressive_url\":\"([^\"]+)\""),
+        Pattern.compile("\"browser_native_sd_url\":\"([^\"]+)\""),
+        Pattern.compile("\"playable_url\":\"([^\"]+)\""),
+        Pattern.compile("\"?sd_src(?:_no_ratelimit)?\"?:\"([^\"]+)\""),
+        Pattern.compile("property=\"og:video(?::secure_url|:url)?\"\\s+content=\"([^\"]+)\""),
+    };
+    private static final Pattern FB_VID = Pattern.compile("(?:/videos/(?:[^/?#]+/)?|/reel/|[?&]v=|story_fbid=|/watch/\\?v=)(\\d+)");
+
+    private static String fbScrape(String html) {
+        for (Pattern p : FB_HTML) {
+            Matcher m = p.matcher(html);
+            while (m.find()) {
+                String v = unescape(m.group(1));
+                if (v.startsWith("http")) return v;
+            }
+        }
+        return null;
+    }
+
+    private static List<String[]> fetchFacebook(String url) throws Exception {
+        url = url.replaceFirst("//(?:m|mbasic|web|touch)\\.facebook\\.com", "//www.facebook.com");
+        StringBuilder log = new StringBuilder();
+        String video = null;
+        String page = url;
+
+        // 1) Página del video (también resuelve fb.watch y /share/)
+        try {
+            Resp r = request("GET", url, null, FB_HEADERS);
+            page = r.finalUrl;
+            if (r.code >= 400) log.append("web=HTTP ").append(r.code).append("; ");
+            else {
+                video = fbScrape(r.body);
+                if (video == null) {
+                    log.append(r.finalUrl.contains("/login") || r.body.contains("login_form")
+                        ? "web=pide login; " : "web=sin video; ");
+                }
+            }
+        } catch (Exception e) {
+            log.append("web=").append(e.getMessage()).append("; ");
+        }
+
+        // 2) Reproductor incrustable
+        if (video == null) {
+            try {
+                String target = page.contains("/login") ? url : page;
+                Resp r = request("GET", "https://www.facebook.com/plugins/video.php?show_text=0&href="
+                    + URLEncoder.encode(target, "UTF-8"), null, FB_HEADERS);
+                if (r.code >= 400) log.append("embed=HTTP ").append(r.code).append("; ");
+                else {
+                    video = fbScrape(r.body);
+                    if (video == null) log.append("embed=sin video; ");
+                }
+            } catch (Exception e) {
+                log.append("embed=").append(e.getMessage()).append("; ");
+            }
+        }
+
+        if (video == null) {
+            throw new Exception("No encontré el video. Puede ser privado, de un grupo cerrado, "
+                + "o Facebook pidió iniciar sesión.\n[" + log.toString().trim() + "]");
+        }
+        Matcher m = FB_VID.matcher(page);
+        String id = m.find() ? m.group(1) : String.valueOf(System.currentTimeMillis());
+        List<String[]> out = new ArrayList<String[]>();
+        out.add(new String[]{video, "fb_" + id + ".mp4"});
+        return out;
     }
 
     // ---------- Red ----------
