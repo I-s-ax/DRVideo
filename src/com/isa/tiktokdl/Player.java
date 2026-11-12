@@ -7,8 +7,6 @@ import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
-import android.graphics.Matrix;
-import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaPlayer;
@@ -18,8 +16,8 @@ import android.text.TextUtils;
 import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
-import android.view.Surface;
-import android.view.TextureView;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -48,11 +46,15 @@ final class Player {
     private final int origOrientation;
 
     private int index;
-    private TextureView tex;
-    private Surface surface;
+    private final Runnable onClose;
+    private FrameLayout root;
+    private SurfaceView sv;
+    private SurfaceHolder holder;
     private MediaPlayer mp;
     private boolean prepared, wantPlay = true, dragging, holding, closed;
     private int vidW, vidH;
+    private int resumeAt;          // posición a retomar si el sistema destruye la superficie
+    private float applied = 1f;    // velocidad realmente aplicada al reproductor
 
     // Ajustes (se recuerdan)
     private float speed;
@@ -65,7 +67,8 @@ final class Player {
     private TextView speedChip, loopChip, fillChip, muteChip, rotChip;
     private SeekBar seek;
 
-    Player(Activity act, SharedPreferences prefs, List<File> files, int start) {
+    Player(Activity act, SharedPreferences prefs, List<File> files, int start, Runnable onClose) {
+        this.onClose = onClose;
         this.act = act;
         this.prefs = prefs;
         this.files = files;
@@ -102,36 +105,36 @@ final class Player {
     // ---------- Interfaz ----------
 
     private View buildUi() {
-        FrameLayout root = new FrameLayout(act);
+        root = new FrameLayout(act);
         root.setBackgroundColor(Color.BLACK);
         root.setKeepScreenOn(true);
 
-        tex = new TextureView(act);
-        tex.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
-            public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
-                surface = new Surface(st);
+        // SurfaceView: el video va directo a pantalla, sin pasar por la GPU de la interfaz
+        sv = new SurfaceView(act);
+        sv.getHolder().addCallback(new SurfaceHolder.Callback() {
+            public void surfaceCreated(SurfaceHolder h) {
+                holder = h;
                 open(index);
             }
 
-            public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
-                updateTransform();
-            }
+            public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) { }
 
-            public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            public void surfaceDestroyed(SurfaceHolder h) {
+                // Pasa al salir de la app: guarda dónde iba y suelta el decodificador
+                try {
+                    if (prepared) resumeAt = mp.getCurrentPosition();
+                } catch (Exception ignored) { }
+                wantPlay = false;
+                holder = null;
                 releasePlayer();
-                if (surface != null) surface.release();
-                surface = null;
-                return true;
             }
-
-            public void onSurfaceTextureUpdated(SurfaceTexture st) { }
         });
-        tex.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+        root.addView(sv, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
             public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
-                updateTransform();
+                if (r - l != or - ol || b - t != ob - ot) updateTransform();
             }
         });
-        root.addView(tex, new FrameLayout.LayoutParams(-1, -1));
 
         // Gestos sobre el video
         final GestureDetector gd = new GestureDetector(act, new GestureDetector.SimpleOnGestureListener() {
@@ -148,7 +151,7 @@ final class Player {
 
             @Override
             public boolean onDoubleTap(MotionEvent e) {
-                float x = e.getX() / Math.max(1, tex.getWidth());
+                float x = e.getX() / Math.max(1, root.getWidth());
                 if (x < 0.35f) seekBy(-10000);
                 else if (x > 0.65f) seekBy(10000);
                 else toggle();
@@ -351,63 +354,74 @@ final class Player {
 
     // ---------- Reproducción ----------
 
+    private void createPlayer() {
+        mp = new MediaPlayer();
+        mp.setOnVideoSizeChangedListener(new MediaPlayer.OnVideoSizeChangedListener() {
+            public void onVideoSizeChanged(MediaPlayer m, int w, int h) {
+                if (w == 0 || h == 0 || (w == vidW && h == vidH)) return;
+                vidW = w;
+                vidH = h;
+                // El escalado lo hace el compositor del sistema, no la app
+                if (holder != null) holder.setFixedSize(w, h);
+                updateTransform();
+            }
+        });
+        mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+            public void onPrepared(MediaPlayer m) {
+                prepared = true;
+                m.setLooping(loop == 0);
+                applyVolume();
+                seek.setMax(Math.max(1, m.getDuration()));
+                dur.setText(fmt(m.getDuration()));
+                if (resumeAt > 0) {
+                    seekTo(resumeAt);
+                    resumeAt = 0;
+                }
+                if (wantPlay) play(); else updatePlayButton();
+            }
+        });
+        mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+            public void onCompletion(MediaPlayer m) {
+                if (!prepared) return;
+                if (loop == 1 && files.size() > 1) {
+                    open((index + 1) % files.size());
+                } else {
+                    wantPlay = false;
+                    updatePlayButton();
+                    showControls();
+                }
+            }
+        });
+        mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+            public boolean onError(MediaPlayer m, int what, int extra) {
+                prepared = false;
+                Toast.makeText(act, "No se pudo reproducir (¿todavía se está descargando?)",
+                    Toast.LENGTH_SHORT).show();
+                showControls();
+                return true;
+            }
+        });
+    }
+
     private void open(int i) {
-        if (closed || surface == null) return;
+        if (closed || holder == null) return;
         index = i;
-        releasePlayer();
         File f = files.get(index);
         title.setText(f.getName());
         counter.setText(files.size() > 1 ? (index + 1) + " / " + files.size() : "");
         seek.setProgress(0);
         cur.setText("0:00");
         dur.setText("0:00");
-        vidW = vidH = 0;
-
-        mp = new MediaPlayer();
+        prepared = false;
+        applied = 1f;
         try {
+            // Se reutiliza el mismo reproductor: cambiar de video es más rápido
+            if (mp == null) createPlayer(); else mp.reset();
             mp.setDataSource(f.getAbsolutePath());
-            mp.setSurface(surface);
-            mp.setOnVideoSizeChangedListener(new MediaPlayer.OnVideoSizeChangedListener() {
-                public void onVideoSizeChanged(MediaPlayer m, int w, int h) {
-                    vidW = w;
-                    vidH = h;
-                    updateTransform();
-                }
-            });
-            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
-                public void onPrepared(MediaPlayer m) {
-                    if (m != mp) return;
-                    prepared = true;
-                    m.setLooping(loop == 0);
-                    applyVolume();
-                    seek.setMax(Math.max(1, m.getDuration()));
-                    dur.setText(fmt(m.getDuration()));
-                    if (wantPlay) play(); else updatePlayButton();
-                }
-            });
-            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                public void onCompletion(MediaPlayer m) {
-                    if (m != mp || !prepared) return;
-                    if (loop == 1 && files.size() > 1) {
-                        open((index + 1) % files.size());
-                    } else {
-                        wantPlay = false;
-                        updatePlayButton();
-                        showControls();
-                    }
-                }
-            });
-            mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
-                public boolean onError(MediaPlayer m, int what, int extra) {
-                    prepared = false;
-                    Toast.makeText(act, "No se pudo reproducir (¿todavía se está descargando?)",
-                        Toast.LENGTH_SHORT).show();
-                    showControls();
-                    return true;
-                }
-            });
+            mp.setDisplay(holder);
             mp.prepareAsync();
         } catch (Exception e) {
+            releasePlayer();
             Toast.makeText(act, "No se pudo abrir el video", Toast.LENGTH_SHORT).show();
         }
     }
@@ -454,12 +468,18 @@ final class Player {
         showControls();
     }
 
-    /** La velocidad solo se aplica mientras reproduce: cambiarla en pausa reanudaría el video. */
+    /**
+     * Solo toca los parámetros de reproducción si la velocidad cambia de verdad:
+     * fijarlos a 1x sin necesidad mete el audio por el estirador de tiempo y provoca cortes.
+     */
     private void applySpeed() {
         refreshChips();
         if (Build.VERSION.SDK_INT < 23 || !isPlaying()) return;
+        float target = holding ? 2f : speed;
+        if (Math.abs(target - applied) < 0.01f) return;
         try {
-            mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(holding ? 2f : speed));
+            mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(target));
+            applied = target;
         } catch (Exception ignored) { }
     }
 
@@ -490,18 +510,20 @@ final class Player {
         } catch (Exception ignored) { }
     }
 
-    /** Ajusta (video completo) o llena (recorta bordes) sin deformar la imagen. */
+    /** Ajusta (video completo) o llena (recorta bordes) cambiando el tamaño de la superficie. */
     private void updateTransform() {
         refreshChips();
-        int vw = tex.getWidth(), vh = tex.getHeight();
+        int vw = root.getWidth(), vh = root.getHeight();
         if (vw == 0 || vh == 0 || vidW == 0 || vidH == 0) return;
-        float sx = (float) vidW / vw, sy = (float) vidH / vh;
         float fit = Math.min((float) vw / vidW, (float) vh / vidH);
         float cover = Math.max((float) vw / vidW, (float) vh / vidH);
         float s = fill ? cover : fit;
-        Matrix m = new Matrix();
-        m.setScale(sx * s, sy * s, vw / 2f, vh / 2f);
-        tex.setTransform(m);
+        int w = Math.round(vidW * s), h = Math.round(vidH * s);
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) sv.getLayoutParams();
+        if (lp.width == w && lp.height == h) return;
+        lp.width = w;
+        lp.height = h;
+        sv.setLayoutParams(lp);
     }
 
     private void releasePlayer() {
@@ -520,6 +542,7 @@ final class Player {
         handler.removeCallbacksAndMessages(null);
         releasePlayer();
         act.setRequestedOrientation(origOrientation);
+        if (onClose != null) onClose.run();
     }
 
     // ---------- Controles ----------
@@ -538,7 +561,7 @@ final class Player {
                     cur.setText(fmt(p));
                 } catch (Exception ignored) { }
             }
-            handler.postDelayed(this, 300);
+            handler.postDelayed(this, 500);
         }
     };
 

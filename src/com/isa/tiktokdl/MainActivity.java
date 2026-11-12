@@ -128,10 +128,10 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (tab == 1 && libKey != null) {
             libKey = null;
-            buildUi();
+            showPage();
         } else if (tab == 1) {
             tab = 0;
-            buildUi();
+            showPage();
         } else {
             super.onBackPressed();
         }
@@ -139,15 +139,16 @@ public class MainActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
-        if (requestCode == REQ_READ) buildUi();
+        if (requestCode == REQ_READ) showPage();
     }
 
     // ---------- Interfaz ----------
 
-    private void buildUi() {
-        String keepText = input != null ? input.getText().toString() : "";
-        String keepStatus = status != null ? status.getText().toString() : null;
+    private FrameLayout pageHost;
+    private LinearLayout navHost;
 
+    /** Arma el marco (fondo, encabezado, barra). Solo hace falta al iniciar o al cambiar el tema. */
+    private void buildUi() {
         dark = !"light".equals(prefs.getString("theme", "dark"));
         cText = dark ? 0xFFFFFFFF : 0xFF141418;
         cSub = dark ? 0xB3FFFFFF : 0x99141418;
@@ -184,19 +185,18 @@ public class MainActivity extends Activity {
         shell.addView(header);
 
         // Contenido de la pestaña
-        View page = tab == 0 ? downloadPage(keepText, keepStatus) : libraryPage();
-        shell.addView(page, new LinearLayout.LayoutParams(-1, 0, 1));
+        pageHost = new FrameLayout(this);
+        shell.addView(pageHost, new LinearLayout.LayoutParams(-1, 0, 1));
 
         // Barra inferior
-        LinearLayout nav = new LinearLayout(this);
-        nav.setBackground(rounded(cCard, 26));
-        nav.setPadding(dp(6), dp(6), dp(6), dp(6));
-        nav.addView(navButton("↓  Descargar", 0), new LinearLayout.LayoutParams(0, -2, 1));
-        nav.addView(navButton("▦  Biblioteca", 1), new LinearLayout.LayoutParams(0, -2, 1));
+        navHost = new LinearLayout(this);
+        navHost.setBackground(rounded(cCard, 26));
+        navHost.setPadding(dp(6), dp(6), dp(6), dp(6));
         LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(-1, -2);
         nlp.setMargins(dp(20), dp(8), dp(20), dp(16));
-        shell.addView(nav, nlp);
+        shell.addView(navHost, nlp);
 
+        showPage();
         setContentView(root);
 
         getWindow().setStatusBarColor(barColor);
@@ -204,6 +204,15 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 23 && !dark) {
             root.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         }
+    }
+
+    /** Cambia solo el contenido de la pestaña, sin reconstruir toda la pantalla. */
+    private void showPage() {
+        pageHost.removeAllViews();
+        pageHost.addView(tab == 0 ? downloadPage() : libraryPage(), new FrameLayout.LayoutParams(-1, -1));
+        navHost.removeAllViews();
+        navHost.addView(navButton("↓  Descargar", 0), new LinearLayout.LayoutParams(0, -2, 1));
+        navHost.addView(navButton("▦  Biblioteca", 1), new LinearLayout.LayoutParams(0, -2, 1));
     }
 
     private TextView navButton(String label, final int target) {
@@ -217,13 +226,15 @@ public class MainActivity extends Activity {
                 if (tab == target && libKey == null) return;
                 tab = target;
                 libKey = null;
-                buildUi();
+                showPage();
             }
         });
         return t;
     }
 
-    private View downloadPage(String keepText, String keepStatus) {
+    private View downloadPage() {
+        String keepText = input != null ? input.getText().toString() : "";
+        String keepStatus = status != null ? status.getText().toString() : null;
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         LinearLayout col = new LinearLayout(this);
@@ -300,11 +311,19 @@ public class MainActivity extends Activity {
         return scroll;
     }
 
+    private Bitmap bgBitmap;
+    private String bgBitmapUri;
+
     /** Pone el fondo elegido y devuelve el color para las barras del sistema. */
     private int applyBackground(FrameLayout root) {
         String bg = prefs.getString("bg", dark ? "noche" : "nieve");
         if ("custom".equals(bg)) {
-            Bitmap bmp = loadBitmap(prefs.getString("bgUri", null));
+            String bgUri = prefs.getString("bgUri", null);
+            if (bgBitmap == null || bgUri == null || !bgUri.equals(bgBitmapUri)) {
+                bgBitmap = loadBitmap(bgUri);
+                bgBitmapUri = bgUri;
+            }
+            Bitmap bmp = bgBitmap;
             if (bmp != null) {
                 ImageView iv = new ImageView(this);
                 iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -556,7 +575,7 @@ public class MainActivity extends Activity {
                 if (tab != 0) {
                     tab = 0;
                     libKey = null;
-                    buildUi();
+                    showPage();
                 }
                 input.setText(url);
                 download();
@@ -703,20 +722,65 @@ public class MainActivity extends Activity {
         }
     };
 
-    private static final Comparator<File> NEWEST = new Comparator<File>() {
+    // Fecha de cada archivo, leída una sola vez (consultarla es lento en el almacenamiento compartido)
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> fileTimes =
+        new java.util.concurrent.ConcurrentHashMap<String, Long>();
+
+    private long timeOf(File f) {
+        Long t = fileTimes.get(f.getPath());
+        if (t == null) {
+            t = f.lastModified();
+            fileTimes.put(f.getPath(), t);
+        }
+        return t;
+    }
+
+    private final Comparator<File> NEWEST = new Comparator<File>() {
         public int compare(File a, File b) {
-            return Long.compare(b.lastModified(), a.lastModified());
+            return Long.compare(timeOf(b), timeOf(a));
         }
     };
+
+    private List<Folder> libCache;     // último escaneo; se muestra al instante
+    private boolean libScanning;
+    private long libScannedAt;
+
+    private static String signature(List<Folder> l) {
+        if (l == null) return "";
+        StringBuilder b = new StringBuilder();
+        for (Folder f : l) b.append(f.key()).append(':').append(f.videos.size()).append(':')
+            .append(f.videos.get(0).getName()).append('|');
+        return b.toString();
+    }
+
+    /** Vuelve a leer las carpetas en segundo plano y refresca la vista solo si algo cambió. */
+    private void refreshLibrary() {
+        if (libScanning || System.currentTimeMillis() - libScannedAt < 3000) return;
+        libScanning = true;
+        new Thread(new Runnable() {
+            public void run() {
+                final List<Folder> fresh = scanLibrary();
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        libScanning = false;
+                        libScannedAt = System.currentTimeMillis();
+                        boolean changed = libCache == null || !signature(fresh).equals(signature(libCache));
+                        libCache = fresh;
+                        if (changed && tab == 1 && pageHost != null) showPage();
+                    }
+                });
+            }
+        }).start();
+    }
 
     private boolean canRead() {
         return Build.VERSION.SDK_INT < 23
             || checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private static boolean isVideo(File f) {
-        String n = f.getName().toLowerCase();
-        return f.isFile() && f.length() > 0 && (n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".webm"));
+    private static boolean isVideo(String name) {
+        String n = name.toLowerCase();
+        return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".webm");
     }
 
     /** Lee Descargas/<red>/<perfil>/ y arma la lista de carpetas, la más reciente primero. */
@@ -730,25 +794,28 @@ public class MainActivity extends Activity {
             loose.net = net;
             loose.user = "";
             for (File c : children) {
-                if (c.isDirectory()) {
+                if (isVideo(c.getName())) {
+                    loose.videos.add(c);
+                } else if (c.isDirectory()) {
                     Folder f = new Folder();
                     f.net = net;
                     f.user = c.getName();
                     File[] vids = c.listFiles();
                     for (int i = 0; vids != null && i < vids.length; i++) {
-                        if (isVideo(vids[i])) f.videos.add(vids[i]);
+                        if (isVideo(vids[i].getName())) f.videos.add(vids[i]);
                     }
                     if (!f.videos.isEmpty()) out.add(f);
-                } else if (isVideo(c)) {
-                    loose.videos.add(c);
                 }
             }
             if (!loose.videos.isEmpty()) out.add(loose);
         }
-        for (Folder f : out) Collections.sort(f.videos, NEWEST);
+        for (Folder f : out) {
+            for (File v : f.videos) fileTimes.put(v.getPath(), v.lastModified());
+            Collections.sort(f.videos, NEWEST);
+        }
         Collections.sort(out, new Comparator<Folder>() {
             public int compare(Folder a, Folder b) {
-                return Long.compare(b.videos.get(0).lastModified(), a.videos.get(0).lastModified());
+                return Long.compare(timeOf(b.videos.get(0)), timeOf(a.videos.get(0)));
             }
         });
         return out;
@@ -778,7 +845,13 @@ public class MainActivity extends Activity {
             return col;
         }
 
-        final List<Folder> folders = scanLibrary();
+        refreshLibrary();
+        if (libCache == null) {
+            col.setGravity(Gravity.CENTER);
+            col.addView(text("Cargando biblioteca…", 14, cSub, false));
+            return col;
+        }
+        final List<Folder> folders = libCache;
         Folder open = null;
         for (Folder f : folders) if (f.key().equals(libKey)) open = f;
         if (open == null) libKey = null;
@@ -809,7 +882,7 @@ public class MainActivity extends Activity {
             grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
                 public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
                     libKey = folders.get(pos).key();
-                    buildUi();
+                    showPage();
                 }
             });
         } else {
@@ -973,6 +1046,7 @@ public class MainActivity extends Activity {
     // ---------- Miniaturas ----------
 
     private final ExecutorService imgPool = Executors.newFixedThreadPool(2);
+    private volatile boolean thumbsPaused;
     private final LruCache<String, Bitmap> imgCache = new LruCache<String, Bitmap>(24 * 1024 * 1024) {
         @Override
         protected int sizeOf(String key, Bitmap b) {
@@ -982,7 +1056,7 @@ public class MainActivity extends Activity {
 
     /** Carga una imagen o la miniatura de un video sin bloquear la interfaz. */
     private void loadImage(final ImageView iv, final File f, final boolean video) {
-        final String key = (video ? "v:" : "i:") + f.getPath() + ":" + f.lastModified();
+        final String key = (video ? "v:" : "i:") + f.getPath() + ":" + (video ? timeOf(f) : f.lastModified());
         iv.setTag(key);
         Bitmap cached = imgCache.get(key);
         if (cached != null) {
@@ -992,6 +1066,16 @@ public class MainActivity extends Activity {
         iv.setImageDrawable(null);
         imgPool.execute(new Runnable() {
             public void run() {
+                // Mientras se reproduce un video no se generan miniaturas: compiten por el decodificador
+                while (thumbsPaused) {
+                    try {
+                        Thread.sleep(200);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+                // Si la celda ya muestra otro archivo (se hizo scroll), no vale la pena el trabajo
+                if (!key.equals(iv.getTag())) return;
                 final Bitmap b = video ? videoThumb(f, key) : decodeSmall(f, 256);
                 if (b == null) return;
                 imgCache.put(key, b);
@@ -1013,7 +1097,10 @@ public class MainActivity extends Activity {
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
             r.setDataSource(f.getPath());
-            Bitmap full = r.getFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            // En Android 8.1+ el sistema entrega el cuadro ya reducido: más rápido y con menos memoria
+            Bitmap full = Build.VERSION.SDK_INT >= 27
+                ? r.getScaledFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 640, 640)
+                : r.getFrameAtTime(1000000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
             if (full == null) return null;
             int w = full.getWidth(), h = full.getHeight();
             float s = Math.min(1f, 360f / Math.min(w, h));
@@ -1049,7 +1136,13 @@ public class MainActivity extends Activity {
     private Player player;
 
     private void play(List<File> videos, int index) {
-        player = new Player(this, prefs, videos, index);
+        thumbsPaused = true;
+        player = new Player(this, prefs, videos, index, new Runnable() {
+            public void run() {
+                player = null;
+                thumbsPaused = false;
+            }
+        });
     }
 
     @Override
