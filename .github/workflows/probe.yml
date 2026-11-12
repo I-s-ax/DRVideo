@@ -1,0 +1,30 @@
+name: Probe libvlc
+on:
+  push:
+    branches: [vlc-probe]
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch libvlc
+        run: |
+          set -x
+          B=https://repo1.maven.org/maven2/org/videolan/android/libvlc-all
+          curl -fsSL $B/maven-metadata.xml > probe/metadata.xml
+          VER=$(grep -o '<version>3\.[0-9]*\.[0-9]*</version>' probe/metadata.xml | sed 's/<[^>]*>//g' | sort -V | tail -1)
+          echo "$VER" > probe/version.txt
+          curl -fsSL -o /tmp/libvlc.aar $B/$VER/libvlc-all-$VER.aar
+          curl -fsSL $B/$VER/libvlc-all-$VER.pom > probe/libvlc.pom
+          unzip -l /tmp/libvlc.aar > probe/aar-listing.txt
+          unzip -q /tmp/libvlc.aar -d /tmp/vlc
+          cp /tmp/vlc/classes.jar probe/libvlc-classes.jar
+          ls -la /tmp/vlc/jni/* > probe/jni.txt
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1); echo "$BT" >> probe/version.txt
+          ls "$ANDROID_HOME"/platforms >> probe/version.txt
+      - name: Commit
+        run: |
+          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          git add probe && git commit -qm "probe results" && git push
