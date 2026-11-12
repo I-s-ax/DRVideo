@@ -22,7 +22,6 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.MediaMetadataRetriever;
-import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -47,12 +46,10 @@ import android.widget.GridView;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.MediaController;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.widget.VideoView;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -854,7 +851,7 @@ public class MainActivity extends Activity {
             grid.setAdapter(new VideoAdapter(f.videos));
             grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
                 public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
-                    play(f.videos.get(pos));
+                    play(f.videos, pos);
                 }
             });
         }
@@ -1049,48 +1046,16 @@ public class MainActivity extends Activity {
 
     // ---------- Reproductor ----------
 
-    private void play(File f) {
-        final Dialog d = new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
-        FrameLayout box = new FrameLayout(this);
-        box.setBackgroundColor(Color.BLACK);
+    private Player player;
 
-        final VideoView vv = new VideoView(this);
-        box.addView(vv, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+    private void play(List<File> videos, int index) {
+        player = new Player(this, prefs, videos, index);
+    }
 
-        TextView close = text("✕", 18, Color.WHITE, true);
-        close.setGravity(Gravity.CENTER);
-        close.setBackground(rounded(0x80000000, 22));
-        close.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { d.dismiss(); }
-        });
-        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP | Gravity.END);
-        clp.setMargins(0, dp(14), dp(14), 0);
-        box.addView(close, clp);
-
-        MediaController mc = new MediaController(this);
-        mc.setAnchorView(vv);
-        vv.setMediaController(mc);
-        vv.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
-            public void onPrepared(MediaPlayer mp) {
-                mp.setLooping(true);
-                vv.start();
-            }
-        });
-        vv.setOnErrorListener(new MediaPlayer.OnErrorListener() {
-            public boolean onError(MediaPlayer mp, int what, int extra) {
-                toast("No se pudo reproducir (¿todavía se está descargando?)");
-                d.dismiss();
-                return true;
-            }
-        });
-        d.setContentView(box);
-        d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
-            public void onDismiss(android.content.DialogInterface di) {
-                vv.stopPlayback();
-            }
-        });
-        d.show();
-        vv.setVideoPath(f.getAbsolutePath());
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (player != null) player.hostPaused();
     }
 
     // ---------- Helpers de UI ----------
