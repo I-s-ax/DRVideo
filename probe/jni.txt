@@ -1,0 +1,31 @@
+/tmp/vlc/jni/arm64-v8a:
+total 53984
+drwxr-xr-x 2 runner runner     4096 Feb  1  1980 .
+drwxr-xr-x 6 runner runner     4096 Feb  1  1980 ..
+-rw-r--r-- 1 runner runner  9290184 Feb  1  1980 libc++_shared.so
+-rw-r--r-- 1 runner runner 45875392 Feb  1  1980 libvlc.so
+-rw-r--r-- 1 runner runner    97736 Feb  1  1980 libvlcjni.so
+
+/tmp/vlc/jni/armeabi-v7a:
+total 39512
+drwxr-xr-x 2 runner runner     4096 Feb  1  1980 .
+drwxr-xr-x 6 runner runner     4096 Feb  1  1980 ..
+-rw-r--r-- 1 runner runner   554808 Feb  1  1980 libc++_shared.so
+-rw-r--r-- 1 runner runner 39822028 Feb  1  1980 libvlc.so
+-rw-r--r-- 1 runner runner    67112 Feb  1  1980 libvlcjni.so
+
+/tmp/vlc/jni/x86:
+total 49672
+drwxr-xr-x 2 runner runner     4096 Feb  1  1980 .
+drwxr-xr-x 6 runner runner     4096 Feb  1  1980 ..
+-rw-r--r-- 1 runner runner   931652 Feb  1  1980 libc++_shared.so
+-rw-r--r-- 1 runner runner 49799728 Feb  1  1980 libvlc.so
+-rw-r--r-- 1 runner runner   116200 Feb  1  1980 libvlcjni.so
+
+/tmp/vlc/jni/x86_64:
+total 62024
+drwxr-xr-x 2 runner runner     4096 Feb  1  1980 .
+drwxr-xr-x 6 runner runner     4096 Feb  1  1980 ..
+-rw-r--r-- 1 runner runner  9015544 Feb  1  1980 libc++_shared.so
+-rw-r--r-- 1 runner runner 54389392 Feb  1  1980 libvlc.so
+-rw-r--r-- 1 runner runner    93768 Feb  1  1980 libvlcjni.so
