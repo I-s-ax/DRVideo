@@ -390,6 +390,28 @@ public class MainActivity extends Activity {
         }
         v.addView(hscroll(icons));
 
+        // Calidad
+        v.addView(section("Calidad de TikTok"));
+        final boolean hd = prefs.getBoolean("ttHd", false);
+        LinearLayout q = new LinearLayout(this);
+        q.addView(chip("Compatible", !hd, new Runnable() {
+            public void run() {
+                prefs.edit().putBoolean("ttHd", false).apply();
+                refreshSettings();
+            }
+        }));
+        q.addView(chip("Máxima (HD)", hd, new Runnable() {
+            public void run() {
+                prefs.edit().putBoolean("ttHd", true).apply();
+                refreshSettings();
+            }
+        }));
+        v.addView(q);
+        TextView qn = text("Compatible baja en H.264, que se reproduce fluido en cualquier teléfono. "
+            + "Máxima baja en 1080p H.265: se ve mejor, pero algunos videos pueden trabarse.", 12, cSub, false);
+        qn.setPadding(0, dp(8), 0, 0);
+        v.addView(qn);
+
         // Cuentas
         v.addView(section("Cuentas (para videos privados)"));
         for (final String[] acc : ACCOUNTS) {
@@ -613,6 +635,7 @@ public class MainActivity extends Activity {
             return;
         }
         final String ck = cookies(NET_IDS[kind]);
+        final boolean ttHd = prefs.getBoolean("ttHd", false);
         final String ua = prefs.getString(NET_IDS[kind] + "Ua", Net.IG_UA);
         setBusy(true);
         status.setText("Obteniendo video de " + NETS[kind] + "…");
@@ -620,7 +643,7 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    List<String[]> items = kind == 0 ? Net.fetchTikTok(url, ck)
+                    List<String[]> items = kind == 0 ? Net.fetchTikTok(url, ck, ttHd)
                         : kind == 1 ? Net.fetchInstagram(url, ck, ua)
                         : kind == 2 ? Net.fetchX(url, ck) : Net.fetchFacebook(url, ck);
                     String folder = NETS[kind];

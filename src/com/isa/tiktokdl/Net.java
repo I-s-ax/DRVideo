@@ -220,10 +220,10 @@ final class Net {
 
     // ---------- TikTok ----------
 
-    static List<String[]> fetchTikTok(String url, String cookies) throws Exception {
+    static List<String[]> fetchTikTok(String url, String cookies, boolean hd) throws Exception {
         boolean logged = cookies != null && cookies.contains("sessionid=");
         try {
-            return ttPublic(url);
+            return ttPublic(url, hd);
         } catch (Exception e) {
             if (!logged) {
                 throw new Exception(e.getMessage()
@@ -238,15 +238,17 @@ final class Net {
         }
     }
 
-    static List<String[]> ttPublic(String url) throws Exception {
+    static List<String[]> ttPublic(String url, boolean hd) throws Exception {
         String api = "https://www.tikwm.com/api/?hd=1&url=" + URLEncoder.encode(url, "UTF-8");
         JSONObject j = new JSONObject(http("GET", api, null, null));
         if (j.optInt("code", -1) != 0) {
             throw new Exception(j.optString("msg", "La API no respondió bien"));
         }
         JSONObject d = j.getJSONObject("data");
-        String video = d.optString("hdplay", "");
-        if (video.isEmpty()) video = d.optString("play", "");
+        // "hdplay" suele venir en H.265 a 1080p, que algunos teléfonos reproducen a tirones;
+        // "play" es H.264, compatible con todo.
+        String video = d.optString(hd ? "hdplay" : "play", "");
+        if (video.isEmpty()) video = d.optString(hd ? "play" : "hdplay", "");
         if (video.isEmpty()) throw new Exception("No hay video (¿es un carrusel de fotos?)");
         if (video.startsWith("/")) video = "https://www.tikwm.com" + video;
 

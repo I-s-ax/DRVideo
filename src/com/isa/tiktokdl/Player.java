@@ -1,6 +1,15 @@
 package com.isa.tiktokdl;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ContentUris;
+import android.content.Intent;
+import android.database.Cursor;
+import android.media.MediaCodecList;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.net.Uri;
+import android.provider.MediaStore;
 import android.app.Dialog;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
@@ -333,6 +342,16 @@ final class Player {
         chips.addView(fillChip);
         chips.addView(muteChip);
         chips.addView(rotChip);
+        TextView infoChip = chip(new Runnable() {
+            public void run() { showInfo(); }
+        });
+        setChip(infoChip, "ⓘ Info", false);
+        chips.addView(infoChip);
+        TextView withChip = chip(new Runnable() {
+            public void run() { openWith(); }
+        });
+        setChip(withChip, "↗ Abrir con", false);
+        chips.addView(withChip);
         HorizontalScrollView hs = new HorizontalScrollView(act);
         hs.setHorizontalScrollBarEnabled(false);
         hs.addView(chips);
@@ -420,6 +439,7 @@ final class Player {
             mp.setDataSource(f.getAbsolutePath());
             mp.setDisplay(holder);
             mp.prepareAsync();
+            warnIfSlow(index);
         } catch (Exception e) {
             releasePlayer();
             Toast.makeText(act, "No se pudo abrir el video", Toast.LENGTH_SHORT).show();
@@ -543,6 +563,170 @@ final class Player {
         releasePlayer();
         act.setRequestedOrientation(origOrientation);
         if (onClose != null) onClose.run();
+    }
+
+    // ---------- Información del archivo ----------
+
+    private static String codecName(String mime) {
+        if ("video/avc".equals(mime)) return "H.264";
+        if ("video/hevc".equals(mime)) return "H.265 (HEVC)";
+        if ("video/av01".equals(mime)) return "AV1";
+        if ("video/x-vnd.on2.vp9".equals(mime)) return "VP9";
+        if ("audio/mp4a-latm".equals(mime)) return "AAC";
+        if ("audio/opus".equals(mime)) return "Opus";
+        return mime.substring(mime.indexOf('/') + 1);
+    }
+
+    private static int num(MediaFormat f, String key) {
+        if (!f.containsKey(key)) return 0;
+        try {
+            return f.getInteger(key);
+        } catch (Exception e) {
+            try {
+                return Math.round(f.getFloat(key));
+            } catch (Exception e2) {
+                return 0;
+            }
+        }
+    }
+
+    private static String decoderFor(MediaFormat f, String mime, int w, int h) {
+        MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+        String name = null;
+        try {
+            if (Build.VERSION.SDK_INT == 21) f.setString(MediaFormat.KEY_FRAME_RATE, null);
+            name = list.findDecoderForFormat(f);
+        } catch (Exception ignored) { }
+        if (name == null && w > 0 && h > 0) {
+            try {
+                name = list.findDecoderForFormat(MediaFormat.createVideoFormat(mime, w, h));
+            } catch (Exception ignored) { }
+        }
+        return name;
+    }
+
+    private static boolean isSoftware(String decoder) {
+        String n = decoder.toLowerCase();
+        return n.startsWith("omx.google.") || n.startsWith("c2.android.") || n.contains(".sw.");
+    }
+
+    /** Describe códecs y decodificador. slow[0] queda en true si el teléfono no lo acelera por hardware. */
+    private static String describe(File f, boolean[] slow) {
+        StringBuilder b = new StringBuilder();
+        MediaExtractor ex = new MediaExtractor();
+        long durUs = 0;
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                MediaFormat mf = ex.getTrackFormat(i);
+                String mime = mf.getString(MediaFormat.KEY_MIME);
+                if (mime == null) continue;
+                if (mf.containsKey(MediaFormat.KEY_DURATION)) durUs = Math.max(durUs, mf.getLong(MediaFormat.KEY_DURATION));
+                if (mime.startsWith("video/")) {
+                    int w = num(mf, MediaFormat.KEY_WIDTH), h = num(mf, MediaFormat.KEY_HEIGHT);
+                    int fps = num(mf, MediaFormat.KEY_FRAME_RATE);
+                    b.append("Video: ").append(codecName(mime)).append(" · ").append(w).append("×").append(h);
+                    if (fps > 0) b.append(" · ").append(fps).append(" fps");
+                    if ("video/hevc".equals(mime) && Build.VERSION.SDK_INT >= 24) {
+                        int p = num(mf, MediaFormat.KEY_PROFILE);
+                        if (p == 0x02 || p == 0x1000 || p == 0x2000) b.append(" · 10 bits (HDR)");
+                    }
+                    String dec = decoderFor(mf, mime, w, h);
+                    boolean soft = dec == null || isSoftware(dec);
+                    if (soft) slow[0] = true;
+                    b.append("\nDecodificador: ").append(dec == null ? "ninguno compatible"
+                        : dec + (soft ? " (por software)" : " (por hardware)")).append('\n');
+                } else if (mime.startsWith("audio/")) {
+                    b.append("Audio: ").append(codecName(mime));
+                    int sr = num(mf, MediaFormat.KEY_SAMPLE_RATE), ch = num(mf, MediaFormat.KEY_CHANNEL_COUNT);
+                    if (sr > 0) b.append(" · ").append(sr / 1000).append(" kHz");
+                    if (ch > 0) b.append(ch == 1 ? " · mono" : ch == 2 ? " · estéreo" : " · " + ch + " canales");
+                    b.append('\n');
+                }
+            }
+        } catch (Exception e) {
+            b.append("No se pudo leer el archivo.\n");
+        } finally {
+            ex.release();
+        }
+        long size = f.length();
+        b.append("Tamaño: ").append(String.format(java.util.Locale.US, "%.1f MB", size / 1048576f));
+        if (durUs > 0) {
+            b.append(String.format(java.util.Locale.US, " · %.1f Mbps", size * 8f / (durUs / 1e6f) / 1e6f));
+        }
+        if (slow[0]) {
+            b.append("\n\nTu teléfono no acelera este formato por hardware, por eso se traba. "
+                + "Prueba «Abrir con» otro reproductor (por ejemplo VLC) o vuelve a descargarlo en calidad Compatible.");
+        }
+        return b.toString();
+    }
+
+    private void showInfo() {
+        final File f = files.get(index);
+        new Thread(new Runnable() {
+            public void run() {
+                final String text = f.getName() + "\n\n" + describe(f, new boolean[1]);
+                handler.post(new Runnable() {
+                    public void run() {
+                        if (closed) return;
+                        new AlertDialog.Builder(act, android.R.style.Theme_Material_Dialog_Alert)
+                            .setTitle("Información del video")
+                            .setMessage(text)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** Avisa si el video que se acaba de abrir no tiene decodificador por hardware. */
+    private void warnIfSlow(final int forIndex) {
+        final File f = files.get(forIndex);
+        new Thread(new Runnable() {
+            public void run() {
+                final boolean[] slow = new boolean[1];
+                describe(f, slow);
+                if (!slow[0]) return;
+                handler.post(new Runnable() {
+                    public void run() {
+                        if (!closed && index == forIndex) {
+                            flash("Formato sin aceleración en tu teléfono: puede trabarse · mira ⓘ Info", 5000);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** Abre el video en otra app (VLC, galería…) usando su entrada en la galería del sistema. */
+    private void openWith() {
+        String path = files.get(index).getAbsolutePath();
+        Uri uri = null;
+        Uri[] tables = {MediaStore.Video.Media.EXTERNAL_CONTENT_URI, MediaStore.Files.getContentUri("external")};
+        for (int i = 0; i < tables.length && uri == null; i++) {
+            try {
+                Cursor c = act.getContentResolver().query(tables[i], new String[]{"_id"},
+                    "_data=?", new String[]{path}, null);
+                if (c != null) {
+                    if (c.moveToFirst()) uri = ContentUris.withAppendedId(tables[i], c.getLong(0));
+                    c.close();
+                }
+            } catch (Exception ignored) { }
+        }
+        if (uri == null) {
+            Toast.makeText(act, "El sistema aún no ha indexado este video", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pause();
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "video/*");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            act.startActivity(Intent.createChooser(i, "Abrir con"));
+        } catch (Exception e) {
+            Toast.makeText(act, "No hay otra app para abrir videos", Toast.LENGTH_SHORT).show();
+        }
     }
 
     // ---------- Controles ----------
