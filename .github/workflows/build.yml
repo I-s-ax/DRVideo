@@ -27,14 +27,24 @@ jobs:
           echo "JAR=$JAR" >> "$GITHUB_ENV"
           echo "build-tools: $BT"; echo "android.jar: $JAR"
 
+      - name: Descargar motor VLC
+        run: |
+          V=3.7.7
+          curl -fsSL -o libvlc.aar "https://repo1.maven.org/maven2/org/videolan/android/libvlc-all/$V/libvlc-all-$V.aar"
+          mkdir -p build/vlc && unzip -q libvlc.aar -d build/vlc
+
       - name: Compilar
         run: |
-          mkdir -p build/classes
+          mkdir -p build/classes build/apk/lib/arm64-v8a
           "$BT/aapt" package -f -M AndroidManifest.xml -S res -I "$JAR" -F build/base.apk
-          javac --release 8 -classpath "$JAR" -d build/classes $(find src -name '*.java')
-          "$BT/d8" --min-api 21 --lib "$JAR" --output build $(find build/classes -name '*.class')
+          javac --release 8 -classpath "$JAR:build/vlc/classes.jar" -d build/classes $(find src -name '*.java')
+          "$BT/d8" --min-api 21 --lib "$JAR" --output build $(find build/classes -name '*.class') build/vlc/classes.jar
           (cd build && zip -q -j base.apk classes.dex)
+          # Librerías nativas de VLC (solo 64 bits, para no duplicar el tamaño del APK)
+          cp build/vlc/jni/arm64-v8a/*.so build/apk/lib/arm64-v8a/
+          (cd build/apk && zip -q -r ../base.apk lib)
           "$BT/zipalign" -f 4 build/base.apk build/aligned.apk
+          ls -la build/aligned.apk
 
       - name: Firmar
         env:

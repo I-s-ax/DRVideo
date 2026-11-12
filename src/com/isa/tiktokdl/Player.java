@@ -18,7 +18,6 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Handler;
 import android.text.TextUtils;
@@ -43,6 +42,7 @@ final class Player {
 
     private static final float[] SPEEDS = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
     private static final String[] LOOPS = {"↻ Repetir", "⇥ Siguiente", "■ Una vez"};
+    private static final String[] ENGINES = {"⚙ Motor: auto", "⚙ Motor: sistema", "⚙ Motor: VLC"};
     private static final String[] ROTS = {"⟳ Giro auto", "⟳ Horizontal", "⟳ Vertical"};
     private static final int PINK = 0xFFFE2C55;
     private static final int HIDE_MS = 3500;
@@ -58,12 +58,13 @@ final class Player {
     private final Runnable onClose;
     private FrameLayout root;
     private SurfaceView sv;
-    private SurfaceHolder holder;
-    private MediaPlayer mp;
+    private Engine engine;
+    private int engineKind;        // 0 sistema, 1 VLC (el que está en uso)
+    private int enginePref;        // 0 auto, 1 sistema, 2 VLC
+    private static boolean vlcBroken;
+    private boolean surfaceReady;
     private boolean prepared, wantPlay = true, dragging, holding, closed;
-    private int vidW, vidH;
-    private int resumeAt;          // posición a retomar si el sistema destruye la superficie
-    private float applied = 1f;    // velocidad realmente aplicada al reproductor
+    private int resumeAt;          // posición a retomar al reabrir el video
 
     // Ajustes (se recuerdan)
     private float speed;
@@ -73,7 +74,7 @@ final class Player {
 
     private View controls;
     private TextView title, counter, playBtn, cur, dur, flash;
-    private TextView speedChip, loopChip, fillChip, muteChip, rotChip;
+    private TextView speedChip, loopChip, fillChip, muteChip, rotChip, engineChip;
     private SeekBar seek;
 
     Player(Activity act, SharedPreferences prefs, List<File> files, int start, Runnable onClose) {
@@ -87,6 +88,7 @@ final class Player {
         loop = prefs.getInt("plLoop", 0);
         fill = prefs.getBoolean("plFill", false);
         mute = prefs.getBoolean("plMute", false);
+        enginePref = prefs.getInt("plEngine", 0);
 
         dialog = new Dialog(act, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
         dialog.setContentView(buildUi());
@@ -99,6 +101,7 @@ final class Player {
             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
 
         handler.post(tick);
+        open(index);
         showControls();
         if (!prefs.getBoolean("plHint", false)) {
             prefs.edit().putBoolean("plHint", true).apply();
@@ -118,27 +121,6 @@ final class Player {
         root.setBackgroundColor(Color.BLACK);
         root.setKeepScreenOn(true);
 
-        // SurfaceView: el video va directo a pantalla, sin pasar por la GPU de la interfaz
-        sv = new SurfaceView(act);
-        sv.getHolder().addCallback(new SurfaceHolder.Callback() {
-            public void surfaceCreated(SurfaceHolder h) {
-                holder = h;
-                open(index);
-            }
-
-            public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) { }
-
-            public void surfaceDestroyed(SurfaceHolder h) {
-                // Pasa al salir de la app: guarda dónde iba y suelta el decodificador
-                try {
-                    if (prepared) resumeAt = mp.getCurrentPosition();
-                } catch (Exception ignored) { }
-                wantPlay = false;
-                holder = null;
-                releasePlayer();
-            }
-        });
-        root.addView(sv, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
             public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
                 if (r - l != or - ol || b - t != ob - ot) updateTransform();
@@ -169,7 +151,7 @@ final class Player {
 
             @Override
             public void onLongPress(MotionEvent e) {
-                if (Build.VERSION.SDK_INT < 23 || !prepared || !isPlaying()) return;
+                if ((engineKind == 0 && Build.VERSION.SDK_INT < 23) || !isPlaying()) return;
                 holding = true;
                 applySpeed();
                 flash("2x ▶▶", 60000);
@@ -312,7 +294,7 @@ final class Player {
             public void run() {
                 loop = (loop + 1) % LOOPS.length;
                 prefs.edit().putInt("plLoop", loop).apply();
-                if (prepared) mp.setLooping(loop == 0);
+                if (engine != null) engine.looping(loop == 0);
             }
         });
         fillChip = chip(new Runnable() {
@@ -337,11 +319,19 @@ final class Player {
                     : ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
             }
         });
-        if (Build.VERSION.SDK_INT >= 23) chips.addView(speedChip);
+        chips.addView(speedChip);
         chips.addView(loopChip);
         chips.addView(fillChip);
         chips.addView(muteChip);
         chips.addView(rotChip);
+        engineChip = chip(new Runnable() {
+            public void run() {
+                enginePref = (enginePref + 1) % ENGINES.length;
+                prefs.edit().putInt("plEngine", enginePref).apply();
+                reopen();
+            }
+        });
+        chips.addView(engineChip);
         TextView infoChip = chip(new Runnable() {
             public void run() { showInfo(); }
         });
@@ -369,61 +359,66 @@ final class Player {
         setChip(fillChip, fill ? "⤢ Llenar" : "⤢ Ajustar", fill);
         setChip(muteChip, mute ? "🔇 Silencio" : "🔊 Sonido", mute);
         setChip(rotChip, ROTS[rot], rot != 0);
+        setChip(engineChip, ENGINES[enginePref] + (enginePref == 0 && engine != null
+            ? (engineKind == 1 ? " (VLC)" : " (sistema)") : ""), enginePref != 0);
     }
 
     // ---------- Reproducción ----------
 
-    private void createPlayer() {
-        mp = new MediaPlayer();
-        mp.setOnVideoSizeChangedListener(new MediaPlayer.OnVideoSizeChangedListener() {
-            public void onVideoSizeChanged(MediaPlayer m, int w, int h) {
-                if (w == 0 || h == 0 || (w == vidW && h == vidH)) return;
-                vidW = w;
-                vidH = h;
-                // El escalado lo hace el compositor del sistema, no la app
-                if (holder != null) holder.setFixedSize(w, h);
-                updateTransform();
+    /** Crea una superficie nueva. Cada motor necesita la suya: no se puede reutilizar entre motores. */
+    private void makeSurface() {
+        if (sv != null) root.removeView(sv);
+        surfaceReady = false;
+        final SurfaceView view = new SurfaceView(act);
+        sv = view;
+        view.getHolder().addCallback(new SurfaceHolder.Callback() {
+            public void surfaceCreated(SurfaceHolder h) {
+                if (view != sv) return;
+                surfaceReady = true;
+                load();
             }
-        });
-        mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
-            public void onPrepared(MediaPlayer m) {
-                prepared = true;
-                m.setLooping(loop == 0);
-                applyVolume();
-                seek.setMax(Math.max(1, m.getDuration()));
-                dur.setText(fmt(m.getDuration()));
-                if (resumeAt > 0) {
-                    seekTo(resumeAt);
-                    resumeAt = 0;
-                }
-                if (wantPlay) play(); else updatePlayButton();
-            }
-        });
-        mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-            public void onCompletion(MediaPlayer m) {
-                if (!prepared) return;
-                if (loop == 1 && files.size() > 1) {
-                    open((index + 1) % files.size());
-                } else {
+
+            public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) { }
+
+            public void surfaceDestroyed(SurfaceHolder h) {
+                if (view != sv) return;
+                // Pasa al salir de la app: guarda dónde iba y suelta el decodificador
+                surfaceReady = false;
+                if (prepared) {
+                    resumeAt = engine.position();
                     wantPlay = false;
-                    updatePlayButton();
-                    showControls();
                 }
+                releaseEngine();
             }
         });
-        mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
-            public boolean onError(MediaPlayer m, int what, int extra) {
-                prepared = false;
-                Toast.makeText(act, "No se pudo reproducir (¿todavía se está descargando?)",
-                    Toast.LENGTH_SHORT).show();
-                showControls();
-                return true;
+        root.addView(view, 0, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+    }
+
+    /** Auto: el sistema para H.264 (lo acelera cualquier chip) y VLC para todo lo demás. */
+    private int pickEngine(File f) {
+        if (vlcBroken || enginePref == 1) return 0;
+        if (enginePref == 2) return 1;
+        String mime = videoMime(f);
+        return mime == null || "video/avc".equals(mime) ? 0 : 1;
+    }
+
+    private static String videoMime(File f) {
+        MediaExtractor ex = new MediaExtractor();
+        try {
+            ex.setDataSource(f.getAbsolutePath());
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                String mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("video/")) return mime;
             }
-        });
+        } catch (Exception ignored) {
+        } finally {
+            ex.release();
+        }
+        return null;
     }
 
     private void open(int i) {
-        if (closed || holder == null) return;
+        if (closed) return;
         index = i;
         File f = files.get(index);
         title.setText(f.getName());
@@ -432,43 +427,100 @@ final class Player {
         cur.setText("0:00");
         dur.setText("0:00");
         prepared = false;
-        applied = 1f;
-        try {
-            // Se reutiliza el mismo reproductor: cambiar de video es más rápido
-            if (mp == null) createPlayer(); else mp.reset();
-            mp.setDataSource(f.getAbsolutePath());
-            mp.setDisplay(holder);
-            mp.prepareAsync();
-            warnIfSlow(index);
-        } catch (Exception e) {
-            releasePlayer();
-            Toast.makeText(act, "No se pudo abrir el video", Toast.LENGTH_SHORT).show();
+
+        int kind = pickEngine(f);
+        if (engine == null || kind != engineKind || !surfaceReady) {
+            // Otro motor (o primera vez): superficie nueva; load() corre cuando esté lista
+            releaseEngine();
+            engineKind = kind;
+            makeSurface();
+        } else {
+            load();
         }
+    }
+
+    private void load() {
+        if (closed || !surfaceReady) return;
+        final File f = files.get(index);
+        final int forIndex = index;
+        prepared = false;
+        try {
+            if (engine == null) engine = engineKind == 1 ? new VlcEngine(act) : new SysEngine();
+        } catch (Throwable t) {
+            // Falta la librería (p. ej. teléfono de 32 bits): se queda con el reproductor del sistema
+            vlcBroken = true;
+            engineKind = 0;
+            engine = new SysEngine();
+            Toast.makeText(act, "VLC no está disponible aquí: " + t.getClass().getSimpleName(),
+                Toast.LENGTH_LONG).show();
+        }
+        refreshChips();
+        engine.looping(loop == 0);
+        engine.mute(mute);
+        engine.layout(root.getWidth(), root.getHeight(), fill);
+        engine.open(f, sv, new Engine.Host() {
+            public void prepared() {
+                if (closed || index != forIndex) return;
+                prepared = true;
+                int d = engine.duration();
+                seek.setMax(Math.max(1, d));
+                dur.setText(fmt(d));
+                engine.layout(root.getWidth(), root.getHeight(), fill);
+                if (resumeAt > 0) {
+                    seekTo(resumeAt);
+                    resumeAt = 0;
+                }
+                if (wantPlay) {
+                    play();
+                } else {
+                    engine.pause();
+                    updatePlayButton();
+                }
+            }
+
+            public void completed() {
+                if (closed || index != forIndex) return;
+                if (loop == 1 && files.size() > 1) {
+                    open((index + 1) % files.size());
+                } else {
+                    wantPlay = false;
+                    updatePlayButton();
+                    showControls();
+                }
+            }
+
+            public void failed(String msg) {
+                if (closed) return;
+                prepared = false;
+                Toast.makeText(act, msg, Toast.LENGTH_SHORT).show();
+                showControls();
+            }
+        });
+        if (engineKind == 0) warnIfSlow(index);
     }
 
     private void step(int delta) {
         if (files.size() < 2) return;
         wantPlay = true;
+        resumeAt = 0;
         open((index + delta + files.size()) % files.size());
         showControls();
     }
 
+    /** Vuelve a abrir el video actual donde iba (al cambiar de motor). */
+    private void reopen() {
+        if (prepared) resumeAt = engine.position();
+        open(index);
+    }
+
     private boolean isPlaying() {
-        try {
-            return prepared && mp != null && mp.isPlaying();
-        } catch (Exception e) {
-            return false;
-        }
+        return prepared && engine != null && engine.playing();
     }
 
     private void play() {
         if (!prepared) return;
         wantPlay = true;
-        try {
-            // Si terminó (modo "una vez"), vuelve al inicio
-            if (mp.getDuration() - mp.getCurrentPosition() < 300) mp.seekTo(0);
-            mp.start();
-        } catch (Exception ignored) { }
+        engine.start();
         applySpeed();
         updatePlayButton();
         showControls();
@@ -476,83 +528,50 @@ final class Player {
 
     private void pause() {
         wantPlay = false;
-        try {
-            if (isPlaying()) mp.pause();
-        } catch (Exception ignored) { }
+        if (prepared) engine.pause();
         updatePlayButton();
         handler.removeCallbacks(hider);
     }
 
     private void toggle() {
-        if (isPlaying()) pause(); else play();
+        if (wantPlay && prepared) pause(); else play();
         showControls();
     }
 
-    /**
-     * Solo toca los parámetros de reproducción si la velocidad cambia de verdad:
-     * fijarlos a 1x sin necesidad mete el audio por el estirador de tiempo y provoca cortes.
-     */
     private void applySpeed() {
         refreshChips();
-        if (Build.VERSION.SDK_INT < 23 || !isPlaying()) return;
-        float target = holding ? 2f : speed;
-        if (Math.abs(target - applied) < 0.01f) return;
-        try {
-            mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(target));
-            applied = target;
-        } catch (Exception ignored) { }
+        if (prepared) engine.speed(holding ? 2f : speed);
     }
 
     private void applyVolume() {
         refreshChips();
-        if (!prepared) return;
-        try {
-            mp.setVolume(mute ? 0f : 1f, mute ? 0f : 1f);
-        } catch (Exception ignored) { }
+        if (engine != null) engine.mute(mute);
     }
 
     private void seekBy(int ms) {
         if (!prepared) return;
-        try {
-            int pos = Math.max(0, Math.min(mp.getDuration(), mp.getCurrentPosition() + ms));
-            seekTo(pos);
-            flash(ms > 0 ? "+10 s ▶▶" : "◀◀ −10 s", 700);
-        } catch (Exception ignored) { }
+        int pos = Math.max(0, Math.min(engine.duration(), engine.position() + ms));
+        seekTo(pos);
+        flash(ms > 0 ? "+10 s ▶▶" : "◀◀ −10 s", 700);
     }
 
     private void seekTo(int pos) {
         if (!prepared) return;
-        try {
-            if (Build.VERSION.SDK_INT >= 26) mp.seekTo(pos, MediaPlayer.SEEK_CLOSEST);
-            else mp.seekTo(pos);
-            seek.setProgress(pos);
-            cur.setText(fmt(pos));
-        } catch (Exception ignored) { }
+        engine.seek(pos);
+        seek.setProgress(pos);
+        cur.setText(fmt(pos));
     }
 
-    /** Ajusta (video completo) o llena (recorta bordes) cambiando el tamaño de la superficie. */
     private void updateTransform() {
         refreshChips();
-        int vw = root.getWidth(), vh = root.getHeight();
-        if (vw == 0 || vh == 0 || vidW == 0 || vidH == 0) return;
-        float fit = Math.min((float) vw / vidW, (float) vh / vidH);
-        float cover = Math.max((float) vw / vidW, (float) vh / vidH);
-        float s = fill ? cover : fit;
-        int w = Math.round(vidW * s), h = Math.round(vidH * s);
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) sv.getLayoutParams();
-        if (lp.width == w && lp.height == h) return;
-        lp.width = w;
-        lp.height = h;
-        sv.setLayoutParams(lp);
+        if (engine != null) engine.layout(root.getWidth(), root.getHeight(), fill);
     }
 
-    private void releasePlayer() {
+    private void releaseEngine() {
         prepared = false;
-        if (mp != null) {
-            try {
-                mp.release();
-            } catch (Exception ignored) { }
-            mp = null;
+        if (engine != null) {
+            engine.release();
+            engine = null;
         }
     }
 
@@ -560,7 +579,7 @@ final class Player {
         if (closed) return;
         closed = true;
         handler.removeCallbacksAndMessages(null);
-        releasePlayer();
+        releaseEngine();
         act.setRequestedOrientation(origOrientation);
         if (onClose != null) onClose.run();
     }
@@ -665,7 +684,8 @@ final class Player {
         final File f = files.get(index);
         new Thread(new Runnable() {
             public void run() {
-                final String text = f.getName() + "\n\n" + describe(f, new boolean[1]);
+                final String text = f.getName() + "\n\n" + describe(f, new boolean[1])
+                    + "\n\nMotor en uso: " + (engine != null ? engine.name() : "—");
                 handler.post(new Runnable() {
                     public void run() {
                         if (closed) return;
@@ -739,11 +759,13 @@ final class Player {
         public void run() {
             if (closed) return;
             if (prepared && !dragging) {
-                try {
-                    int p = mp.getCurrentPosition();
-                    seek.setProgress(p);
-                    cur.setText(fmt(p));
-                } catch (Exception ignored) { }
+                int p = engine.position();
+                seek.setProgress(p);
+                cur.setText(fmt(p));
+                if (seek.getMax() <= 1 && engine.duration() > 0) {
+                    seek.setMax(engine.duration());
+                    dur.setText(fmt(engine.duration()));
+                }
             }
             handler.postDelayed(this, 500);
         }
@@ -752,7 +774,7 @@ final class Player {
     private void showControls() {
         controls.setVisibility(View.VISIBLE);
         handler.removeCallbacks(hider);
-        if (isPlaying() || (wantPlay && !prepared)) handler.postDelayed(hider, HIDE_MS);
+        if (wantPlay) handler.postDelayed(hider, HIDE_MS);
     }
 
     private void hideControls() {
@@ -761,7 +783,7 @@ final class Player {
     }
 
     private void updatePlayButton() {
-        playBtn.setText(isPlaying() ? "❚❚" : "▶");
+        playBtn.setText(wantPlay ? "❚❚" : "▶");
     }
 
     private void flash(String s, int ms) {
